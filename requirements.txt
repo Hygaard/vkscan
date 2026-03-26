@@ -1,0 +1,7 @@
+# Runtime dependencies
+Pillow>=10.0.0
+imagehash>=4.3.0
+send2trash>=1.8.0  # Safe deletion (trash/recycle bin)
+
+# Build dependency (optional - only needed for creating executable)
+# pyinstaller>=6.0.0

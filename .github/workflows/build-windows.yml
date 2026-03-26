@@ -1,0 +1,89 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:  # Manual trigger from GitHub UI
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile ^
+            --windowed ^
+            --name "VKScan" ^
+            --icon "vkscan_icon.ico" ^
+            --add-data "vkscan_icon.ico;." ^
+            --add-data "vkscan_icon.png;." ^
+            --hidden-import=tkinter ^
+            --hidden-import=tkinter.ttk ^
+            --hidden-import=tkinter.filedialog ^
+            --hidden-import=tkinter.messagebox ^
+            --hidden-import=tkinter.scrolledtext ^
+            --hidden-import=PIL ^
+            --hidden-import=PIL.Image ^
+            --hidden-import=PIL.ImageTk ^
+            --hidden-import=imagehash ^
+            --hidden-import=send2trash ^
+            vkscan.py
+        shell: cmd
+
+      - name: Verify build
+        run: |
+          if (Test-Path "dist\VKScan.exe") {
+            $size = (Get-Item "dist\VKScan.exe").Length / 1MB
+            Write-Host "Build successful! Size: $([math]::Round($size, 1)) MB"
+          } else {
+            Write-Error "Build failed - exe not found"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VKScan-Windows
+          path: dist/VKScan.exe
+          retention-days: 90
+
+  # Automatically create a GitHub Release when a version tag is pushed
+  release:
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: VKScan-Windows
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: VKScan.exe
+          generate_release_notes: true
+          draft: false
