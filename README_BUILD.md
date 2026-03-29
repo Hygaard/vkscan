@@ -1,17 +1,17 @@
-# Building VKScan for Windows
+# Building VKScan
 
 ## Pre-Built Downloads
 
-Pre-built Windows `.exe` files are available on the [Releases](../../releases) page.
+Pre-built executables for Windows, Linux, and macOS are available on the [Releases](../../releases) page.
 
 ---
 
-## Building Locally (on a Windows machine)
+## Building Locally
 
 ### Quick Build (One-Liner)
 
-```batch
-pip install pyinstaller pillow imagehash send2trash && pyinstaller --onefile --windowed --name VKScan --icon vkscan_icon.ico vkscan.py
+```bash
+pip install pyinstaller -r requirements.txt && pyinstaller --onefile --windowed --name VKScan --icon vkscan_icon.ico vkscan.py
 ```
 
 The executable will be in `dist\VKScan.exe`
@@ -20,8 +20,8 @@ The executable will be in `dist\VKScan.exe`
 
 #### 1. Install Dependencies
 
-```batch
-pip install pyinstaller pillow imagehash send2trash
+```bash
+pip install pyinstaller -r requirements.txt
 ```
 
 #### 2. Run the Build Script
@@ -129,4 +129,4 @@ PyInstaller executables are commonly flagged by antivirus software. Options:
 | Single file (`.exe`) | ~50-70 MB |
 | One directory (zipped) | ~50-70 MB (split across files) |
 
-The size includes the Python 3.12 interpreter and all dependencies (Pillow, imagehash, send2trash, tkinter).
+The size includes the Python 3.12 interpreter and all dependencies (Pillow, imagehash, send2trash, pdfplumber, python-docx, openpyxl, odfpy, tkinter).
