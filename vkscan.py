@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.0.0
+VKScan with GUI - v1.1.0
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.0.0
+Version: 1.1.0
 """
 
 import os
@@ -22,17 +22,20 @@ import threading
 import math
 import shutil
 import filecmp
-import platform
 import time
 import csv
 import subprocess
 import queue
+import json
+import argparse
+import re
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Set, Tuple, Callable
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -47,9 +50,19 @@ try:
 except ImportError:
     HAS_SEND2TRASH = False
 
+# Optional: tkinterdnd2 for native drag-and-drop
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
 # =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
+
+# Version
+VERSION = "1.1.0"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -91,6 +104,17 @@ else:
 # Minimum file size to bother deduplicating (skip zero-byte files)
 MIN_FILE_SIZE_BYTES = 1
 
+# Minimum number of images to justify ProcessPoolExecutor overhead
+# Below this, ThreadPoolExecutor is used (avoids process spawn cost)
+PROCESS_POOL_THRESHOLD = 50
+
+# Settings persistence
+if sys.platform == "win32":
+    CONFIG_DIR = Path(os.environ.get('APPDATA', '~')) / 'VKScan'
+else:
+    CONFIG_DIR = Path.home() / '.config' / 'vkscan'
+CONFIG_FILE = CONFIG_DIR / 'settings.json'
+
 
 # =============================================================================
 # RUNTIME CONFIGURATION
@@ -106,6 +130,203 @@ class Config:
     suppress_similarity_warning: bool = False  # Don't warn about non-100% auto-select
 
 _config = Config()
+
+# Saved scan settings (populated by load_settings)
+_saved_scan_paths: List[str] = []
+_saved_scan_exclusions: List[str] = []
+_saved_scan_perceptual: bool = True
+
+
+def save_settings(scan_paths: Optional[List[str]] = None,
+                  scan_exclusions: Optional[List[str]] = None,
+                  scan_perceptual: Optional[bool] = None) -> None:
+    global _saved_scan_paths, _saved_scan_exclusions, _saved_scan_perceptual
+    if scan_paths is not None:
+        _saved_scan_paths = list(scan_paths)
+    if scan_exclusions is not None:
+        _saved_scan_exclusions = list(scan_exclusions)
+    if scan_perceptual is not None:
+        _saved_scan_perceptual = scan_perceptual
+    data = {
+        "image_similarity_threshold": _config.image_similarity_threshold,
+        "workers": _config.workers,
+        "use_trash": _config.use_trash,
+        "skip_empty_files": _config.skip_empty_files,
+        "scan_paths": _saved_scan_paths,
+        "scan_exclusions": _saved_scan_exclusions,
+        "scan_perceptual": _saved_scan_perceptual,
+    }
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_settings() -> None:
+    global _saved_scan_paths, _saved_scan_exclusions, _saved_scan_perceptual
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if "image_similarity_threshold" in data:
+            _config.image_similarity_threshold = int(data["image_similarity_threshold"])
+        if "workers" in data:
+            _config.workers = max(1, int(data["workers"]))
+        if "use_trash" in data:
+            _config.use_trash = bool(data["use_trash"])
+        if "skip_empty_files" in data:
+            _config.skip_empty_files = bool(data["skip_empty_files"])
+        if "scan_paths" in data and isinstance(data["scan_paths"], list):
+            _saved_scan_paths = [str(p) for p in data["scan_paths"]]
+        if "scan_exclusions" in data and isinstance(data["scan_exclusions"], list):
+            _saved_scan_exclusions = [str(e) for e in data["scan_exclusions"]]
+        if "scan_perceptual" in data:
+            _saved_scan_perceptual = bool(data["scan_perceptual"])
+    except Exception:
+        pass
+
+
+# =============================================================================
+# HASH CACHE (SQLite)
+# =============================================================================
+
+CACHE_DB = CONFIG_DIR / 'hash_cache.db'
+
+
+class HashCache:
+    """Persistent hash cache backed by SQLite.
+
+    Caches SHA-256 and perceptual hashes keyed by (path, mtime, size).
+    If a file's mtime or size changes, the cached hash is considered stale
+    and will be recomputed. Thread-safe via check_same_thread=False and
+    a threading lock for writes.
+
+    The cache is stored alongside settings in the VKScan config directory.
+    """
+
+    def __init__(self, db_path: Path = CACHE_DB):
+        self._lock = threading.Lock()
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS hash_cache (
+                    path TEXT NOT NULL,
+                    mtime REAL NOT NULL,
+                    size INTEGER NOT NULL,
+                    sha256 TEXT,
+                    quick_hash TEXT,
+                    phash TEXT,
+                    PRIMARY KEY (path, mtime, size)
+                )
+            """)
+            self._conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_path ON hash_cache(path)
+            """)
+            self._conn.commit()
+            self._enabled = True
+        except Exception:
+            self._conn = None
+            self._enabled = False
+
+    def get(self, path: str, mtime: float, size: int) -> Dict[str, Optional[str]]:
+        """Look up cached hashes for a file.
+
+        Returns dict with keys 'sha256', 'quick_hash', 'phash' (any may be None).
+        Returns empty dict on miss.
+        """
+        if not self._enabled:
+            return {}
+        try:
+            row = self._conn.execute(
+                "SELECT sha256, quick_hash, phash FROM hash_cache WHERE path=? AND mtime=? AND size=?",
+                (path, mtime, size)
+            ).fetchone()
+            if row:
+                return {"sha256": row[0], "quick_hash": row[1], "phash": row[2]}
+        except Exception:
+            pass
+        return {}
+
+    def put(self, path: str, mtime: float, size: int,
+            sha256: Optional[str] = None, quick_hash: Optional[str] = None,
+            phash: Optional[str] = None) -> None:
+        """Store or update cached hashes for a file."""
+        if not self._enabled:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO hash_cache
+                       (path, mtime, size, sha256, quick_hash, phash)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (path, mtime, size, sha256, quick_hash, phash)
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def put_batch(self, entries: List[Tuple]) -> None:
+        """Batch insert/update cached hashes.
+
+        Each entry is (path, mtime, size, sha256, quick_hash, phash).
+        """
+        if not self._enabled or not entries:
+            return
+        with self._lock:
+            try:
+                self._conn.executemany(
+                    """INSERT OR REPLACE INTO hash_cache
+                       (path, mtime, size, sha256, quick_hash, phash)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    entries
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def prune_missing(self) -> int:
+        """Remove entries for files that no longer exist. Returns count removed."""
+        if not self._enabled:
+            return 0
+        with self._lock:
+            try:
+                rows = self._conn.execute("SELECT path FROM hash_cache").fetchall()
+                missing = [r[0] for r in rows if not os.path.exists(r[0])]
+                if missing:
+                    self._conn.executemany(
+                        "DELETE FROM hash_cache WHERE path=?",
+                        [(p,) for p in missing]
+                    )
+                    self._conn.commit()
+                return len(missing)
+            except Exception:
+                return 0
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+
+# Global hash cache instance (lazy-initialized)
+_hash_cache: Optional[HashCache] = None
+
+
+def get_hash_cache() -> HashCache:
+    """Get or create the global hash cache instance."""
+    global _hash_cache
+    if _hash_cache is None:
+        _hash_cache = HashCache()
+    return _hash_cache
 
 
 # =============================================================================
@@ -226,6 +447,240 @@ def safe_delete(path: str) -> None:
 
 
 # =============================================================================
+# EXPORT FUNCTIONS (used by both GUI and CLI)
+# =============================================================================
+
+def export_txt(path: str, duplicate_groups: List[DuplicateGroup]) -> None:
+    """Export report as formatted text."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("VKScan Report\n")
+        f.write("=" * 50 + "\n\n")
+
+        total_recoverable = 0
+        for i, group in enumerate(duplicate_groups, 1):
+            recoverable = group.recoverable_size()
+            total_recoverable += recoverable
+
+            type_str = "(similar)" if group.is_perceptual else "(exact)"
+            if group.verified:
+                type_str += " [verified]"
+            f.write(
+                f"Group {i}: {len(group.files)} file(s), "
+                f"Similarity: {group.similarity:.1f}% {type_str}\n"
+            )
+            f.write(f"  Recoverable: {format_size(recoverable)}\n")
+            for file_info in group.files:
+                mtime_str = datetime.fromtimestamp(file_info.mtime).strftime(
+                    "%Y-%m-%d %H:%M"
+                ) if file_info.mtime else ""
+                f.write(f"  {file_info.path}  ({format_size(file_info.size)}, {mtime_str})\n")
+            f.write("\n")
+
+        f.write("=" * 50 + "\n")
+        f.write(
+            f"Total groups: {len(duplicate_groups)}\n"
+            f"Total recoverable: {format_size(total_recoverable)}\n"
+        )
+
+
+def export_csv(path: str, duplicate_groups: List[DuplicateGroup]) -> None:
+    """Export report as CSV for spreadsheet use."""
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Group", "Type", "Similarity", "File Path", "Size (bytes)", "Size", "Modified"])
+        for i, group in enumerate(duplicate_groups, 1):
+            type_str = "similar" if group.is_perceptual else "exact"
+            for file_info in group.files:
+                mtime_str = datetime.fromtimestamp(file_info.mtime).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ) if file_info.mtime else ""
+                writer.writerow([
+                    i, type_str, f"{group.similarity:.1f}%",
+                    file_info.path, file_info.size, format_size(file_info.size),
+                    mtime_str
+                ])
+
+
+def export_json(path: str, duplicate_groups: List[DuplicateGroup]) -> None:
+    """Export report as JSON for programmatic consumption."""
+    data = {
+        "version": VERSION,
+        "total_groups": len(duplicate_groups),
+        "total_recoverable_bytes": sum(g.recoverable_size() for g in duplicate_groups),
+        "total_recoverable": format_size(sum(g.recoverable_size() for g in duplicate_groups)),
+        "groups": []
+    }
+    for i, group in enumerate(duplicate_groups, 1):
+        group_data = {
+            "group": i,
+            "type": "similar" if group.is_perceptual else "exact",
+            "similarity": round(group.similarity, 1),
+            "verified": group.verified,
+            "recoverable_bytes": group.recoverable_size(),
+            "recoverable": format_size(group.recoverable_size()),
+            "files": []
+        }
+        for file_info in group.files:
+            mtime_str = datetime.fromtimestamp(file_info.mtime).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ) if file_info.mtime else ""
+            group_data["files"].append({
+                "path": file_info.path,
+                "size_bytes": file_info.size,
+                "size": format_size(file_info.size),
+                "modified": mtime_str,
+                "sha256": file_info.hash or None,
+                "phash": file_info.p_hash or None,
+            })
+        data["groups"].append(group_data)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# =============================================================================
+# BK-TREE FOR HAMMING DISTANCE SEARCH
+# =============================================================================
+
+class BKTree:
+    """Burkhard-Keller tree for efficient Hamming distance nearest-neighbor search.
+
+    Instead of comparing every hash pair O(n^2), BKTree indexes hashes
+    and finds all neighbors within a threshold in O(n log n) average case.
+    This is critical for large image collections (10k+ images).
+
+    Each node stores a hash string and children keyed by Hamming distance.
+    The triangle inequality of Hamming distance allows pruning subtrees
+    that cannot contain matches.
+    """
+
+    def __init__(self):
+        self._root: Optional[Tuple[str, Dict]] = None
+        self._size = 0
+
+    def insert(self, hash_str: str) -> None:
+        """Insert a hash into the tree."""
+        if self._root is None:
+            self._root = (hash_str, {})
+            self._size += 1
+            return
+
+        node = self._root
+        while True:
+            node_hash, children = node
+            d = hamming_distance(hash_str, node_hash)
+            if d == 0:
+                return  # Duplicate hash, already present
+            if d in children:
+                node = children[d]
+            else:
+                children[d] = (hash_str, {})
+                self._size += 1
+                return
+
+    def find_within(self, query: str, threshold: int) -> List[Tuple[str, int]]:
+        """Find all hashes within the given Hamming distance threshold.
+
+        Args:
+            query: Hash string to search for
+            threshold: Maximum Hamming distance (inclusive)
+
+        Returns:
+            List of (hash, distance) tuples for all matches
+        """
+        if self._root is None:
+            return []
+
+        results: List[Tuple[str, int]] = []
+        stack = [self._root]
+
+        while stack:
+            node_hash, children = stack.pop()
+            d = hamming_distance(query, node_hash)
+
+            if d <= threshold:
+                results.append((node_hash, d))
+
+            # Triangle inequality: only visit children where
+            # |d - threshold| <= child_distance <= d + threshold
+            low = max(0, d - threshold)
+            high = d + threshold
+            for child_dist, child_node in children.items():
+                if low <= child_dist <= high:
+                    stack.append(child_node)
+
+        return results
+
+    def __len__(self) -> int:
+        return self._size
+
+
+# =============================================================================
+# TOP-LEVEL FUNCTIONS FOR MULTIPROCESSING
+# =============================================================================
+# ProcessPoolExecutor requires picklable (top-level) functions.
+# These are standalone versions of compute methods for cross-process use.
+
+def _compute_perceptual_hash_standalone(args: Tuple[str, float, int]) -> Optional[str]:
+    """Compute perceptual hash of an image (top-level for ProcessPoolExecutor).
+
+    Must be a module-level function so it can be pickled and sent to
+    worker processes. Duplicates the logic from DuplicateScanner but
+    without any instance state.
+
+    Args:
+        args: Tuple of (path, mtime, size) for cache support
+
+    Returns:
+        Hex-encoded perceptual hash or None on error
+    """
+    path, mtime, size = args
+
+    # Each worker process gets its own cache connection
+    try:
+        cache = get_hash_cache()
+        cached = cache.get(path, mtime, size)
+        if cached and cached.get("phash"):
+            return cached["phash"]
+    except Exception:
+        cache = None
+
+    try:
+        file_size = os.path.getsize(path)
+        if file_size > MAX_IMAGE_FILE_BYTES:
+            return None
+
+        with Image.open(path) as img:
+            if img.width * img.height > MAX_IMAGE_PIXELS:
+                return None
+            img.verify()
+
+        with Image.open(path) as img:
+            if img.width * img.height > MAX_IMAGE_PIXELS:
+                return None
+
+            if img.mode not in ("RGB",):
+                img = img.convert("RGB")
+
+            ph = phash(img, hash_size=PHASH_BLOCK_SIZE)
+            result = str(ph)
+
+            # Store in cache
+            if cache:
+                try:
+                    cache.put(path, mtime, size, phash=result)
+                except Exception:
+                    pass
+
+            return result
+
+    except (PermissionError, OSError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
+# =============================================================================
 # DUPLICATE SCANNER
 # =============================================================================
 
@@ -254,33 +709,59 @@ class DuplicateScanner:
         """Check if file is an image based on extension."""
         return Path(path).suffix.lower() in IMAGE_EXTENSIONS
 
-    def compute_quick_hash(self, path: str) -> Optional[str]:
+    def compute_quick_hash(self, path: str, mtime: float = 0, size: int = 0) -> Optional[str]:
         """Compute a fast hash of the first 4KB of a file for quick-reject.
 
         Files that differ in their first 4KB cannot be duplicates,
         so this avoids reading the entire file for obvious mismatches.
+        Uses the hash cache when mtime/size are provided.
 
         Returns:
             Hex-encoded SHA-256 hash of header bytes, or None on error
         """
+        # Check cache first
+        if mtime and size:
+            cache = get_hash_cache()
+            cached = cache.get(path, mtime, size)
+            if cached and cached.get("quick_hash"):
+                return cached["quick_hash"]
+
         try:
             with open(path, "rb") as f:
                 header = f.read(QUICK_HASH_SIZE)
                 if not header:
                     return None
-                return hashlib.sha256(header).hexdigest()
+                result = hashlib.sha256(header).hexdigest()
+
+                # Store in cache
+                if mtime and size:
+                    cache = get_hash_cache()
+                    cache.put(path, mtime, size, quick_hash=result)
+
+                return result
         except (PermissionError, OSError):
             return None
 
-    def compute_hash(self, path: str) -> Optional[str]:
+    def compute_hash(self, path: str, mtime: float = 0, size: int = 0) -> Optional[str]:
         """Compute SHA-256 hash of a file.
+
+        Uses the hash cache when mtime/size are provided.
 
         Args:
             path: Path to file
+            mtime: File modification time (for cache lookup)
+            size: File size in bytes (for cache lookup)
 
         Returns:
             Hex-encoded SHA-256 hash or None on error
         """
+        # Check cache first
+        if mtime and size:
+            cache = get_hash_cache()
+            cached = cache.get(path, mtime, size)
+            if cached and cached.get("sha256"):
+                return cached["sha256"]
+
         try:
             hasher = hashlib.sha256()
             with open(path, "rb") as f:
@@ -291,19 +772,37 @@ class DuplicateScanner:
                     hasher.update(chunk)
             if self.cancelled:
                 return None  # Don't return partial hash on cancel
-            return hasher.hexdigest()
+            result = hasher.hexdigest()
+
+            # Store in cache
+            if mtime and size:
+                cache = get_hash_cache()
+                cache.put(path, mtime, size, sha256=result)
+
+            return result
         except (PermissionError, OSError):
             return None
 
-    def compute_perceptual_hash(self, path: str) -> Optional[str]:
+    def compute_perceptual_hash(self, path: str, mtime: float = 0, size: int = 0) -> Optional[str]:
         """Compute perceptual hash of an image.
+
+        Uses the hash cache when mtime/size are provided.
 
         Args:
             path: Path to image file
+            mtime: File modification time (for cache lookup)
+            size: File size in bytes (for cache lookup)
 
         Returns:
             Hex-encoded perceptual hash or None on error
         """
+        # Check cache first
+        if mtime and size:
+            cache = get_hash_cache()
+            cached = cache.get(path, mtime, size)
+            if cached and cached.get("phash"):
+                return cached["phash"]
+
         try:
             file_size = os.path.getsize(path)
             if file_size > MAX_IMAGE_FILE_BYTES:
@@ -322,7 +821,14 @@ class DuplicateScanner:
                     img = img.convert("RGB")
 
                 ph = phash(img, hash_size=PHASH_BLOCK_SIZE)
-                return str(ph)
+                result = str(ph)
+
+                # Store in cache
+                if mtime and size:
+                    cache = get_hash_cache()
+                    cache.put(path, mtime, size, phash=result)
+
+                return result
 
         except (PermissionError, OSError, ValueError):
             return None
@@ -493,7 +999,7 @@ class DuplicateScanner:
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             future_to_file = {
-                pool.submit(self.compute_quick_hash, fi.path): fi
+                pool.submit(self.compute_quick_hash, fi.path, fi.mtime, fi.size): fi
                 for fi in candidate_files
             }
 
@@ -538,7 +1044,7 @@ class DuplicateScanner:
         if full_hash_candidates:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 future_to_file = {
-                    pool.submit(self.compute_hash, fi.path): fi
+                    pool.submit(self.compute_hash, fi.path, fi.mtime, fi.size): fi
                     for fi in full_hash_candidates
                 }
 
@@ -636,17 +1142,31 @@ class DuplicateScanner:
         if not image_files or self.cancelled:
             return duplicate_groups
 
-        # Parallel perceptual hashing
-        self._update_progress(60, f"STAGE:4/4:Verifying|55|Image hashes: 0 / {len(image_files):,} ({workers} threads)")
+        # Parallel perceptual hashing — use ProcessPoolExecutor for CPU-bound
+        # DCT work when there are enough images to justify process spawn overhead.
+        # Falls back to ThreadPoolExecutor for small batches.
+        use_processes = len(image_files) >= PROCESS_POOL_THRESHOLD
+        pool_label = "processes" if use_processes else "threads"
+        self._update_progress(60, f"STAGE:4/4:Verifying|55|Image hashes: 0 / {len(image_files):,} ({workers} {pool_label})")
         phash_groups: Dict[str, List[FileInfo]] = defaultdict(list)
         processed = 0
         last_update = time.monotonic()
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_to_file = {
-                pool.submit(self.compute_perceptual_hash, fi.path): fi
-                for fi in image_files
-            }
+        PoolClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+
+        with PoolClass(max_workers=workers) as pool:
+            if use_processes:
+                # ProcessPoolExecutor: use top-level picklable function (takes tuple)
+                future_to_file = {
+                    pool.submit(_compute_perceptual_hash_standalone, (fi.path, fi.mtime, fi.size)): fi
+                    for fi in image_files
+                }
+            else:
+                # ThreadPoolExecutor: use instance method (no pickle needed)
+                future_to_file = {
+                    pool.submit(self.compute_perceptual_hash, fi.path, fi.mtime, fi.size): fi
+                    for fi in image_files
+                }
 
             for future in as_completed(future_to_file):
                 if self.cancelled:
@@ -670,20 +1190,26 @@ class DuplicateScanner:
                     stage_pct = 55 + int((processed / len(image_files)) * 25)
                     self._update_progress(
                         60 + int((processed / len(image_files)) * 20),
-                        f"STAGE:4/4:Verifying|{stage_pct}|Image hashes: {processed:,} / {len(image_files):,} ({workers} threads)"
+                        f"STAGE:4/4:Verifying|{stage_pct}|Image hashes: {processed:,} / {len(image_files):,} ({workers} {pool_label})"
                     )
 
         if not self.cancelled and phash_groups:
-            self._update_progress(80, "STAGE:4/4:Verifying|80|Finding similar images...")
+            self._update_progress(80, "STAGE:4/4:Verifying|80|Building BK-tree for similarity search...")
 
-            hash_keys = sorted(phash_groups.keys())
-            num_pairs = len(hash_keys) * (len(hash_keys) - 1) // 2
-            pair_count = 0
+            hash_keys = list(phash_groups.keys())
+            total_hashes = len(hash_keys)
+
+            # Build BK-tree — O(n log n) insert
+            bk_tree = BKTree()
+            for ph in hash_keys:
+                bk_tree.insert(ph)
+
             merged_groups: Set[str] = set()
-
+            grouped_paths: Set[str] = set()  # Track all paths already in a group
             last_update = time.monotonic()
 
-            for i, ph1 in enumerate(hash_keys):
+            # Query each hash for neighbors — O(n log n) total vs O(n^2) brute force
+            for idx, ph1 in enumerate(hash_keys):
                 if self.cancelled:
                     break
 
@@ -694,57 +1220,49 @@ class DuplicateScanner:
                 if not files1:
                     continue
 
-                for j, ph2 in enumerate(hash_keys[i + 1:], i + 1):
-                    if self.cancelled:
-                        break
+                # Find all hashes within threshold (includes self at distance 0)
+                neighbors = bk_tree.find_within(ph1, _config.image_similarity_threshold)
 
-                    if ph2 in merged_groups:
-                        continue
+                # Separate exact matches (distance=0) from similar matches
+                similar_hashes = [(nh, d) for nh, d in neighbors if d > 0 and nh not in merged_groups]
 
-                    pair_count += 1
-                    distance = hamming_distance(ph1, ph2)
+                if similar_hashes:
+                    # Merge all similar hashes into one group with this hash
+                    combined = list(files1)
+                    min_distance = min(d for _, d in similar_hashes)
 
-                    if 0 < distance <= _config.image_similarity_threshold:
-                        files2 = phash_groups[ph2]
-                        if not files2:
-                            continue
+                    for nh, d in similar_hashes:
+                        nh_files = phash_groups[nh]
+                        if nh_files:
+                            combined.extend(nh_files)
+                            merged_groups.add(nh)
+                            phash_groups[nh] = []
 
-                        similarity = calculate_similarity(distance)
-                        combined = files1 + files2
-
-                        combined_paths = {f.path for f in combined}
-                        already_grouped = False
-
-                        for dg in duplicate_groups:
-                            dg_paths = {f.path for f in dg.files}
-                            if combined_paths & dg_paths:
-                                already_grouped = True
-                                break
-
-                        if not already_grouped:
-                            dg = DuplicateGroup(
-                                files=combined,
-                                similarity=similarity,
-                                is_perceptual=True
-                            )
-                            duplicate_groups.append(dg)
-                            if group_callback:
-                                group_callback(dg)
-
-                        merged_groups.add(ph1)
-                        merged_groups.add(ph2)
-                        phash_groups[ph2] = []
-
-                    now = time.monotonic()
-                    if num_pairs > 0 and now - last_update > 0.1:
-                        last_update = now
-                        stage_pct = 80 + int((pair_count / num_pairs) * 20)
-                        self._update_progress(
-                            80 + int((pair_count / num_pairs) * 15),
-                            f"STAGE:4/4:Verifying|{stage_pct}|Comparing: {pair_count:,} / {num_pairs:,} pairs"
+                    combined_paths = {f.path for f in combined}
+                    if not (combined_paths & grouped_paths):
+                        similarity = calculate_similarity(min_distance)
+                        dg = DuplicateGroup(
+                            files=combined,
+                            similarity=similarity,
+                            is_perceptual=True
                         )
+                        duplicate_groups.append(dg)
+                        grouped_paths.update(combined_paths)
+                        if group_callback:
+                            group_callback(dg)
 
-            # Exact perceptual hash matches
+                    merged_groups.add(ph1)
+
+                now = time.monotonic()
+                if now - last_update > 0.1:
+                    last_update = now
+                    stage_pct = 80 + int((idx / max(total_hashes, 1)) * 20)
+                    self._update_progress(
+                        80 + int((idx / max(total_hashes, 1)) * 15),
+                        f"STAGE:4/4:Verifying|{stage_pct}|BK-tree search: {idx:,} / {total_hashes:,} hashes"
+                    )
+
+            # Exact perceptual hash matches (same hash, different files)
             for ph, img_files in phash_groups.items():
                 if self.cancelled:
                     break
@@ -754,21 +1272,14 @@ class DuplicateScanner:
 
                 if len(img_files) >= 2:
                     img_paths = {f.path for f in img_files}
-                    already_grouped = False
-
-                    for dg in duplicate_groups:
-                        dg_paths = {f.path for f in dg.files}
-                        if img_paths & dg_paths:
-                            already_grouped = True
-                            break
-
-                    if not already_grouped:
+                    if not (img_paths & grouped_paths):
                         dg = DuplicateGroup(
                             files=img_files,
                             similarity=100.0,
                             is_perceptual=True
                         )
                         duplicate_groups.append(dg)
+                        grouped_paths.update(img_paths)
                         if group_callback:
                             group_callback(dg)
 
@@ -785,7 +1296,7 @@ class DuplicateFinderApp:
     def __init__(self, root: tk.Tk):
         """Initialize the application."""
         self.root = root
-        self.root.title("VKScan v1.0.0")
+        self.root.title(f"VKScan v{VERSION}")
         self.root.geometry("x".join(map(str, DEFAULT_WINDOW_SIZE)))
         self.root.minsize(*MIN_WINDOW_SIZE)
 
@@ -798,6 +1309,12 @@ class DuplicateFinderApp:
         self._populating = False  # Guard flag for tree population
         self._active_dropdown = None  # Currently open dropdown menu
         self._is_scanning = False  # True while scan is running
+        self._last_scan_options: Optional[ScanOptions] = None
+        self._stage_start_time: Optional[float] = None
+        self._current_stage_key: str = ""
+        self._detached_items: Dict[str, Tuple[str, int]] = {}  # Filter: item_id -> (parent, index)
+
+        load_settings()
 
         self._setup_styles()
         self._apply_dark_titlebar(self.root)
@@ -811,6 +1328,7 @@ class DuplicateFinderApp:
         self.root.bind("<Control-e>", lambda e: self._export_report())
         self.root.bind("<Control-o>", lambda e: self._open_file_location())
         self.root.bind("<Escape>", lambda e: self._deselect_all())
+        self.root.bind("<Control-f>", lambda e: self._focus_filter_search())
 
     # Dark theme color palette
     BG_DARK = "#1e1e2e"
@@ -1154,7 +1672,8 @@ class DuplicateFinderApp:
         """Close the currently open dropdown."""
         if self._active_dropdown:
             btn, dropdown = self._active_dropdown
-            btn.config(bg=self.BG_DARK)
+            if btn is not None:
+                btn.config(bg=self.BG_DARK)
             dropdown.destroy()
             self._active_dropdown = None
 
@@ -1180,6 +1699,7 @@ class DuplicateFinderApp:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         self._create_control_panel(main_frame)
+        self._create_filter_bar(main_frame)
 
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -1287,6 +1807,12 @@ class DuplicateFinderApp:
         )
         self.cancel_btn.pack(side=tk.LEFT, padx=5)
 
+        self.rescan_btn = ttk.Button(
+            btn_frame, text="\u27f3 Rescan", command=self._rescan,
+            state="disabled"
+        )
+        self.rescan_btn.pack(side=tk.LEFT, padx=5)
+
         # Progress area
         progress_frame = ttk.Frame(parent)
         progress_frame.pack(fill=tk.X, pady=(0, 5))
@@ -1317,6 +1843,229 @@ class DuplicateFinderApp:
 
         # Keep progress_label as a hidden reference for compatibility
         self.progress_label = self.stage_label
+
+    def _create_filter_bar(self, parent: tk.Frame) -> None:
+        """Create filter bar for filtering scan results.
+        
+        Provides: text search (filename/path), type filter (All/Exact/Similar),
+        and minimum size filter. Filters use detach/reattach on treeview items
+        so no data is lost — just visually hidden.
+        """
+        filter_frame = tk.Frame(parent, bg=self.BG_MEDIUM, bd=0)
+        filter_frame.pack(fill=tk.X, pady=(5, 0))
+
+        # Inner padding
+        inner = tk.Frame(filter_frame, bg=self.BG_MEDIUM, bd=0)
+        inner.pack(fill=tk.X, padx=8, pady=4)
+
+        # Search icon + entry
+        tk.Label(
+            inner, text="🔍", bg=self.BG_MEDIUM, fg=self.TEXT_SECONDARY,
+            font=("Segoe UI", 10)
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._filter_search_var = tk.StringVar()
+        self._filter_search_var.trace_add("write", lambda *_: self._apply_filters())
+        search_entry = tk.Entry(
+            inner, textvariable=self._filter_search_var, width=25,
+            bg=self.BG_LIGHT, fg=self.TEXT_PRIMARY,
+            insertbackground=self.TEXT_PRIMARY,
+            relief="flat", font=("Segoe UI", 10), bd=0,
+            highlightthickness=1, highlightcolor=self.ACCENT,
+            highlightbackground=self.BORDER
+        )
+        search_entry.pack(side=tk.LEFT, padx=(0, 10), ipady=2)
+        self._filter_search_entry = search_entry  # Store ref for Ctrl+F focus
+
+        # Placeholder text
+        def _on_focus_in(e):
+            if search_entry.get() == "":
+                pass  # placeholder handled by StringVar
+        def _on_focus_out(e):
+            pass
+        search_entry.bind("<FocusIn>", _on_focus_in)
+        search_entry.bind("<FocusOut>", _on_focus_out)
+
+        # Type filter: All / Exact / Similar
+        tk.Label(
+            inner, text="Type:", bg=self.BG_MEDIUM, fg=self.TEXT_SECONDARY,
+            font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._filter_type_var = tk.StringVar(value="All")
+        for label in ("All", "Exact", "Similar"):
+            rb = tk.Radiobutton(
+                inner, text=label, variable=self._filter_type_var, value=label,
+                bg=self.BG_MEDIUM, fg=self.TEXT_PRIMARY,
+                selectcolor=self.BG_LIGHT, activebackground=self.BG_MEDIUM,
+                activeforeground=self.TEXT_PRIMARY,
+                font=("Segoe UI", 9), bd=0, highlightthickness=0,
+                command=self._apply_filters
+            )
+            rb.pack(side=tk.LEFT, padx=2)
+
+        # Separator
+        tk.Frame(inner, bg=self.BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=8, pady=2
+        )
+
+        # Min size filter
+        tk.Label(
+            inner, text="Min size:", bg=self.BG_MEDIUM, fg=self.TEXT_SECONDARY,
+            font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._filter_size_var = tk.StringVar(value="Any")
+        size_options = ["Any", "1 KB", "100 KB", "1 MB", "10 MB", "100 MB", "1 GB"]
+        size_menu = tk.OptionMenu(inner, self._filter_size_var, *size_options,
+                                  command=lambda _: self._apply_filters())
+        size_menu.config(
+            bg=self.BG_LIGHT, fg=self.TEXT_PRIMARY,
+            activebackground=self.ACCENT, activeforeground="#ffffff",
+            highlightthickness=0, bd=0, font=("Segoe UI", 9),
+            relief="flat"
+        )
+        size_menu["menu"].config(
+            bg=self.BG_LIGHT, fg=self.TEXT_PRIMARY,
+            activebackground=self.ACCENT, activeforeground="#ffffff",
+            font=("Segoe UI", 9), bd=0
+        )
+        size_menu.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Clear filters button
+        clear_btn = tk.Label(
+            inner, text="✕ Clear", bg=self.BG_MEDIUM, fg=self.TEXT_MUTED,
+            font=("Segoe UI", 9), cursor="hand2", padx=4
+        )
+        clear_btn.pack(side=tk.LEFT, padx=(0, 4))
+        clear_btn.bind("<Button-1>", lambda e: self._clear_filters())
+        clear_btn.bind("<Enter>", lambda e: clear_btn.config(fg=self.TEXT_PRIMARY))
+        clear_btn.bind("<Leave>", lambda e: clear_btn.config(fg=self.TEXT_MUTED))
+
+        # Match count label
+        self._filter_count_label = tk.Label(
+            inner, text="", bg=self.BG_MEDIUM, fg=self.TEXT_MUTED,
+            font=("Segoe UI", 9)
+        )
+        self._filter_count_label.pack(side=tk.RIGHT)
+
+    def _focus_filter_search(self) -> None:
+        """Focus the filter search entry (Ctrl+F)."""
+        try:
+            self._filter_search_entry.focus_set()
+            self._filter_search_entry.select_range(0, tk.END)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _clear_filters(self) -> None:
+        """Reset all filters to defaults."""
+        self._filter_search_var.set("")
+        self._filter_type_var.set("All")
+        self._filter_size_var.set("Any")
+        self._apply_filters()
+
+    def _parse_min_size_bytes(self) -> int:
+        """Parse the min size dropdown value to bytes."""
+        SIZE_MAP = {
+            "Any": 0, "1 KB": 1024, "100 KB": 102400,
+            "1 MB": 1048576, "10 MB": 10485760,
+            "100 MB": 104857600, "1 GB": 1073741824
+        }
+        return SIZE_MAP.get(self._filter_size_var.get(), 0)
+
+    def _apply_filters(self) -> None:
+        """Apply all active filters to the treeview using detach/reattach.
+        
+        This preserves all data — items are just visually hidden when filtered out.
+        When filters are cleared, all items reappear in their original positions.
+        """
+        if self._is_scanning or self._populating:
+            return
+
+        search_text = self._filter_search_var.get().lower().strip()
+        type_filter = self._filter_type_var.get()  # "All", "Exact", "Similar"
+        min_size = self._parse_min_size_bytes()
+        SIZE_MULT = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+
+        # First, reattach everything that was previously detached
+        for item_id, (parent, idx) in list(self._detached_items.items()):
+            try:
+                self.tree.reattach(item_id, parent, idx)
+            except tk.TclError:
+                pass  # Item may have been deleted
+        self._detached_items.clear()
+
+        visible_groups = 0
+        total_groups = 0
+
+        # Now evaluate each group
+        for group_id in list(self.tree.get_children()):
+            total_groups += 1
+            header = self.tree.item(group_id, "text")
+            children = list(self.tree.get_children(group_id))
+
+            # Type filter: check group header
+            if type_filter == "Exact" and "(similar)" in header:
+                # Detach entire group
+                idx = self.tree.index(group_id)
+                self._detached_items[group_id] = ("", idx)
+                self.tree.detach(group_id)
+                continue
+            elif type_filter == "Similar" and "(similar)" not in header:
+                idx = self.tree.index(group_id)
+                self._detached_items[group_id] = ("", idx)
+                self.tree.detach(group_id)
+                continue
+
+            # For each child, check search text and min size
+            visible_children = 0
+            for child_id in children:
+                values = self.tree.item(child_id, "values")
+                if not values:
+                    continue
+
+                path = values[0].lower() if values[0] else ""
+                filename = Path(path).name if path else ""
+
+                # Parse size
+                size_bytes = 0
+                try:
+                    parts = values[1].split()
+                    size_bytes = int(float(parts[0]) * SIZE_MULT.get(parts[1] if len(parts) > 1 else "B", 1))
+                except (ValueError, IndexError):
+                    pass
+
+                # Check filters
+                match = True
+                if search_text and search_text not in path and search_text not in filename:
+                    match = False
+                if min_size > 0 and size_bytes < min_size:
+                    match = False
+
+                if not match:
+                    idx = self.tree.index(child_id)
+                    self._detached_items[child_id] = (group_id, idx)
+                    self.tree.detach(child_id)
+                else:
+                    visible_children += 1
+
+            # If no children visible, hide the group too
+            remaining = list(self.tree.get_children(group_id))
+            if not remaining:
+                idx = self.tree.index(group_id)
+                self._detached_items[group_id] = ("", idx)
+                self.tree.detach(group_id)
+            else:
+                visible_groups += 1
+
+        # Update count label
+        is_filtered = bool(search_text or type_filter != "All" or min_size > 0)
+        if is_filtered:
+            self._filter_count_label.config(
+                text=f"Showing {visible_groups} / {total_groups} groups"
+            )
+        else:
+            self._filter_count_label.config(text="")
 
     def _create_status_bar(self, parent: tk.Frame) -> None:
         """Create status bar."""
@@ -1394,8 +2143,20 @@ class DuplicateFinderApp:
         if dialog.result:
             self._perform_scan(dialog.result)
 
+    def _rescan(self) -> None:
+        if self._last_scan_options is None:
+            return
+        if self.scan_thread and self.scan_thread.is_alive():
+            messagebox.showinfo("Busy", "Please wait or cancel current scan.")
+            return
+        self._perform_scan(self._last_scan_options)
+
     def _perform_scan(self, options: ScanOptions) -> None:
         """Perform the actual scan operation."""
+        self._last_scan_options = options
+        self._stage_start_time = None
+        self._current_stage_key = ""
+        save_settings(scan_paths=options.paths, scan_exclusions=list(options.exclusions), scan_perceptual=options.perceptual)
         self.cancel_btn.config(state="normal")
         self.progress_var.set(0)
         self.progress_label.config(text="Scanning...")
@@ -1407,6 +2168,10 @@ class DuplicateFinderApp:
         self._progress_queue: queue.Queue = queue.Queue()
         self._scan_finished = False
         self._live_group_count = 0  # Track groups added during scan
+
+        # Clear filters and detached items before new scan
+        self._detached_items.clear()
+        self._clear_filters()
 
         # Clear tree for fresh scan
         for item in self.tree.get_children():
@@ -1492,6 +2257,7 @@ class DuplicateFinderApp:
                     # Final re-sort and status update (groups already in tree)
                     self._finalize_tree()
                     self.cancel_btn.config(state="disabled")
+                    self.rescan_btn.config(state="normal")
                     self.stage_label.config(text="Scan Complete")
                     self.detail_label.config(text="")
                     self.overall_label.config(text="")
@@ -1520,6 +2286,21 @@ class DuplicateFinderApp:
                         header, stage_pct_str, detail = latest_message[6:].split("|", 2)
                         stage_num_str, stage_name = header.split(":", 1)
                         stage_pct = int(stage_pct_str)
+                        # ETA computation
+                        if stage_num_str != self._current_stage_key:
+                            self._current_stage_key = stage_num_str
+                            self._stage_start_time = time.monotonic()
+                        if stage_pct > 5 and self._stage_start_time is not None:
+                            elapsed = time.monotonic() - self._stage_start_time
+                            if elapsed >= 2.0:
+                                eta_seconds = elapsed / stage_pct * (100 - stage_pct)
+                                if eta_seconds < 60:
+                                    eta_str = f"{int(eta_seconds)}s"
+                                elif eta_seconds < 3600:
+                                    eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                                else:
+                                    eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m"
+                                detail = f"{detail}  (ETA: ~{eta_str})"
                         self.stage_label.config(text=f"Stage {stage_num_str}: {stage_name}")
                         self.progress_var.set(stage_pct)
                         self.detail_label.config(text=detail)
@@ -1581,7 +2362,7 @@ class DuplicateFinderApp:
                     mtime_str,
                     f"{group.similarity:.1f}%"
                 ),
-                tags=(row_tag,)
+                tags=(row_tag, f"sz:{file_info.size}")
             )
 
         # Update status with running count
@@ -1680,7 +2461,7 @@ class DuplicateFinderApp:
                             mtime_str,
                             f"{group.similarity:.1f}%"
                         ),
-                        tags=(row_tag,)
+                        tags=(row_tag, f"sz:{file_info.size}")
                     )
 
             trash_note = ""
@@ -1771,7 +2552,7 @@ class DuplicateFinderApp:
             paths = self._get_group_paths(item)
 
         if paths:
-            pw = PreviewWindow(self.root, paths)
+            pw = PreviewWindow(self.root, paths, on_delete=self._on_preview_delete)
             self._center_dialog(pw.top, 700, 500)
             self._apply_dark_titlebar(pw.top)
 
@@ -1789,7 +2570,7 @@ class DuplicateFinderApp:
         # Multiple items selected — preview just those
         paths = self._get_selected_paths()
         if paths:
-            pw = PreviewWindow(self.root, paths)
+            pw = PreviewWindow(self.root, paths, on_delete=self._on_preview_delete)
             self._center_dialog(pw.top, 700, 500)
             self._apply_dark_titlebar(pw.top)
 
@@ -1797,7 +2578,7 @@ class DuplicateFinderApp:
         """Compare selected files side by side."""
         paths = self._get_selected_paths()
         if len(paths) >= 2:
-            cw = ComparisonWindow(self.root, paths[:2])
+            cw = ComparisonWindow(self.root, paths[:2], on_delete=self._on_preview_delete)
             self._center_dialog(cw.top, 900, 600)
             self._apply_dark_titlebar(cw.top)
 
@@ -1902,9 +2683,7 @@ class DuplicateFinderApp:
         self._close_dropdown()
 
         # Reuse the same Toplevel dropdown system as the menu bar
-        # Create a temporary "button" reference for the dropdown tracker
-        dummy_btn = tk.Label(self.root)  # won't be displayed
-
+        # Use None for the button ref (context menus have no anchor button)
         x = event.x_root
         y = event.y_root
 
@@ -1942,7 +2721,7 @@ class DuplicateFinderApp:
                 widget.bind("<Button-1>", lambda e, cmd=command: self._dropdown_click(cmd))
 
         dropdown.geometry(f"+{x}+{y}")
-        self._active_dropdown = (dummy_btn, dropdown)
+        self._active_dropdown = (None, dropdown)
 
     def _open_file_location(self) -> None:
         """Open the containing folder of the selected file in the system file manager."""
@@ -2090,6 +2869,21 @@ class DuplicateFinderApp:
             text=f"Auto-selected {selected_count} duplicate(s) (keeping best quality in each group){similar_note}"
         )
 
+    @staticmethod
+    def _get_size_from_tags(tags) -> int:
+        """Extract raw file size in bytes from treeview item tags.
+        
+        Tags include 'sz:12345' where 12345 is the exact byte count,
+        avoiding lossy re-parsing of display strings like '1.5 MB'.
+        """
+        for tag in tags:
+            if isinstance(tag, str) and tag.startswith("sz:"):
+                try:
+                    return int(tag[3:])
+                except ValueError:
+                    pass
+        return 0
+
     def _pick_best_file(self, children) -> int:
         """Determine which file in a group to KEEP (index to not select).
 
@@ -2099,8 +2893,6 @@ class DuplicateFinderApp:
 
         Returns the index of the file to keep.
         """
-        SIZE_MULT = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
-
         # Gather info about each child
         file_info = []  # [(index, path, size_bytes, mtime_timestamp)]
         for i, child in enumerate(children):
@@ -2111,13 +2903,9 @@ class DuplicateFinderApp:
 
             path = values[0]
 
-            # Parse size back to bytes
-            size_bytes = 0
-            try:
-                parts = values[1].split()
-                size_bytes = int(float(parts[0]) * SIZE_MULT.get(parts[1] if len(parts) > 1 else "B", 1))
-            except (ValueError, IndexError):
-                pass
+            # Read exact size from tag (no lossy display-string parsing)
+            tags = self.tree.item(child, "tags")
+            size_bytes = self._get_size_from_tags(tags)
 
             # Parse mtime
             mtime = float("inf")
@@ -2274,6 +3062,11 @@ class DuplicateFinderApp:
             else:
                 self.tree.heading(c, command=lambda _c=c: self._sort_column(_c, False))
 
+    def _on_preview_delete(self, path: str) -> None:
+        """Called when a file is deleted from a preview/comparison window."""
+        self._purge_missing_files()
+        self._populate_tree()
+
     def _purge_missing_files(self) -> None:
         """Remove files that no longer exist from duplicate_groups."""
         for group in self.duplicate_groups:
@@ -2289,14 +3082,21 @@ class DuplicateFinderApp:
 
         path = filedialog.asksaveasfilename(
             defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv")],
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("CSV files", "*.csv"),
+                ("JSON files", "*.json"),
+            ],
             title="Save Report As"
         )
 
         if path:
             try:
-                if path.lower().endswith(".csv"):
+                lower = path.lower()
+                if lower.endswith(".csv"):
                     self._export_csv(path)
+                elif lower.endswith(".json"):
+                    self._export_json(path)
                 else:
                     self._export_txt(path)
                 messagebox.showinfo("Done", f"Report saved to:\n{path}")
@@ -2305,52 +3105,15 @@ class DuplicateFinderApp:
 
     def _export_txt(self, path: str) -> None:
         """Export report as formatted text."""
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("VKScan Report\n")
-            f.write("=" * 50 + "\n\n")
-
-            total_recoverable = 0
-            for i, group in enumerate(self.duplicate_groups, 1):
-                recoverable = group.recoverable_size()
-                total_recoverable += recoverable
-
-                type_str = "(similar)" if group.is_perceptual else "(exact)"
-                if group.verified:
-                    type_str += " [verified]"
-                f.write(
-                    f"Group {i}: {len(group.files)} file(s), "
-                    f"Similarity: {group.similarity:.1f}% {type_str}\n"
-                )
-                f.write(f"  Recoverable: {format_size(recoverable)}\n")
-                for file_info in group.files:
-                    mtime_str = datetime.fromtimestamp(file_info.mtime).strftime(
-                        "%Y-%m-%d %H:%M"
-                    ) if file_info.mtime else ""
-                    f.write(f"  {file_info.path}  ({format_size(file_info.size)}, {mtime_str})\n")
-                f.write("\n")
-
-            f.write("=" * 50 + "\n")
-            f.write(
-                f"Total groups: {len(self.duplicate_groups)}\n"
-                f"Total recoverable: {format_size(total_recoverable)}\n"
-            )
+        export_txt(path, self.duplicate_groups)
 
     def _export_csv(self, path: str) -> None:
         """Export report as CSV for spreadsheet use."""
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Group", "Type", "Similarity", "File Path", "Size (bytes)", "Size", "Modified"])
-            for i, group in enumerate(self.duplicate_groups, 1):
-                type_str = "similar" if group.is_perceptual else "exact"
-                for file_info in group.files:
-                    mtime_str = datetime.fromtimestamp(file_info.mtime).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ) if file_info.mtime else ""
-                    writer.writerow([
-                        i, type_str, f"{group.similarity:.1f}%",
-                        file_info.path, file_info.size, format_size(file_info.size),
-                        mtime_str
-                    ])
+        export_csv(path, self.duplicate_groups)
+
+    def _export_json(self, path: str) -> None:
+        """Export report as JSON for programmatic consumption."""
+        export_json(path, self.duplicate_groups)
 
     def _show_options(self) -> None:
         """Show options dialog."""
@@ -2365,7 +3128,7 @@ class DuplicateFinderApp:
         cpu = os.cpu_count() or "?"
         messagebox.showinfo(
             "About",
-            "VKScan v1.0.0\n\n"
+            f"VKScan v{VERSION}\n\n"
             "A comprehensive duplicate file detection tool.\n\n"
             "Features:\n"
             "• Exact duplicate detection (SHA-256 + byte verify)\n"
@@ -2415,12 +3178,29 @@ class ScanDialog:
             insertbackground=DuplicateFinderApp.TEXT_PRIMARY)
         self.paths_text.pack(fill=tk.BOTH, expand=True, pady=(2, 5))
 
+        # Native drag-and-drop (requires tkinterdnd2)
+        if HAS_DND:
+            try:
+                self.paths_text.drop_target_register(DND_FILES)
+                self.paths_text.dnd_bind('<<Drop>>', self._on_drop)
+                dnd_hint = " (or drag && drop folders here)"
+            except Exception:
+                dnd_hint = ""
+        else:
+            dnd_hint = ""
+
+        # Clipboard paste support (Ctrl+V inserts folder paths)
+        self.paths_text.bind("<Control-v>", self._on_paste)
+
         btn_frame = ttk.Frame(content)
         btn_frame.pack(fill=tk.X, pady=(0, 10))
 
         ttk.Button(btn_frame, text="📁 Add Folder", command=self._add_folder).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="💿 Add Drive", command=self._add_drive).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Clear", command=lambda: self.paths_text.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=5)
+        if dnd_hint:
+            ttk.Label(btn_frame, text=dnd_hint, foreground=DuplicateFinderApp.TEXT_MUTED,
+                      font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=5)
 
         ttk.Label(content, text="Exclusions (one per line):").pack(anchor=tk.W)
         self.excl_text = scrolledtext.ScrolledText(
@@ -2428,9 +3208,16 @@ class ScanDialog:
             bg=DuplicateFinderApp.BG_LIGHT, fg=DuplicateFinderApp.TEXT_PRIMARY,
             insertbackground=DuplicateFinderApp.TEXT_PRIMARY)
         self.excl_text.pack(fill=tk.BOTH, expand=True, pady=(2, 5))
-        self.excl_text.insert(1.0, DEFAULT_EXCLUSIONS)
+        if _saved_scan_exclusions:
+            self.excl_text.insert(1.0, "\n".join(_saved_scan_exclusions))
+        else:
+            self.excl_text.insert(1.0, DEFAULT_EXCLUSIONS)
 
-        self.perceptual_var = tk.BooleanVar(value=True)
+        # Pre-populate paths from saved settings
+        if _saved_scan_paths:
+            self.paths_text.insert(1.0, "\n".join(_saved_scan_paths) + "\n")
+
+        self.perceptual_var = tk.BooleanVar(value=_saved_scan_perceptual)
         ttk.Checkbutton(
             content,
             text="Perceptual image comparison (slower but finds similar images)",
@@ -2449,6 +3236,66 @@ class ScanDialog:
         self.top.bind("<Return>", lambda e: self._on_scan())
         self.top.bind("<Escape>", lambda e: self.top.destroy())
         self.top.focus_set()
+
+    def _on_drop(self, event) -> None:
+        """Handle drag-and-drop of files/folders onto the paths text area."""
+        # tkinterdnd2 returns paths in various formats depending on OS
+        data = event.data
+        if not data:
+            return
+        # On Windows, paths with spaces are wrapped in {curly braces}
+        # On Linux/macOS, paths are space-separated
+        paths = []
+        if '{' in data:
+            # Windows format: {C:\path with spaces} {D:\another path}
+            paths = re.findall(r'\{([^}]+)\}', data)
+            # Also capture unbraced paths
+            remaining = re.sub(r'\{[^}]+\}', '', data).strip()
+            if remaining:
+                paths.extend(remaining.split())
+        else:
+            paths = data.split()
+
+        for p in paths:
+            p = p.strip()
+            if p and os.path.isdir(p):
+                self.paths_text.insert(tk.END, p + "\n")
+
+    def _on_paste(self, event) -> None:
+        """Handle Ctrl+V paste — extract valid directory paths from clipboard.
+        
+        Handles plain paths, quoted paths, and file:// URIs from file managers.
+        """
+        try:
+            clipboard = self.top.clipboard_get()
+        except tk.TclError:
+            return  # Empty clipboard
+
+        if not clipboard:
+            return
+
+        # Try to extract paths from the clipboard (one per line, or space-separated)
+        added = False
+        for line in clipboard.replace('\r', '').split('\n'):
+            line = line.strip().strip('"').strip("'")
+            # Handle file:// URIs (from file managers)
+            if line.startswith("file:///"):
+                if sys.platform == "win32":
+                    line = line[8:]  # file:///C:/path -> C:/path
+                else:
+                    line = line[7:]  # file:///path -> /path
+                # Decode percent-encoded characters (%20 -> space, etc.)
+                try:
+                    from urllib.parse import unquote
+                    line = unquote(line)
+                except ImportError:
+                    pass
+            if line and os.path.isdir(line):
+                self.paths_text.insert(tk.END, line + "\n")
+                added = True
+
+        if added:
+            return "break"  # Prevent default paste behavior
 
     def _add_folder(self) -> None:
         folder = filedialog.askdirectory()
@@ -2578,6 +3425,7 @@ class OptionsDialog:
         _config.use_trash = self.trash_var.get()
         _config.skip_empty_files = self.skip_empty_var.get()
         _config.workers = max(1, int(self.workers_scale.get()))
+        save_settings()
         self.top.destroy()
 
     def _on_scale_change(self, value: str) -> None:
@@ -2608,7 +3456,7 @@ class PreviewWindow:
     FG3 = DuplicateFinderApp.TEXT_MUTED
     ACCENT = DuplicateFinderApp.ACCENT
 
-    def __init__(self, parent: tk.Tk, paths: List[str]):
+    def __init__(self, parent: tk.Tk, paths: List[str], on_delete: Optional[Callable] = None):
         self.top = tk.Toplevel(parent)
         self.top.title("Preview")
         self.top.geometry("800x600")
@@ -2619,6 +3467,7 @@ class PreviewWindow:
         self.current_index = 0
         self._photo_ref = None  # Strong ref for current image
         self._pil_images: Dict[int, Image.Image] = {}  # Cache loaded PIL images
+        self._on_delete = on_delete
 
         self._build_ui()
         self._show_current()
@@ -2629,6 +3478,7 @@ class PreviewWindow:
         self.top.bind("<Up>", lambda e: self._navigate(-1))
         self.top.bind("<Down>", lambda e: self._navigate(1))
         self.top.bind("<Escape>", lambda e: self._on_close())
+        self.top.bind("<Delete>", lambda e: self._delete_current())
 
         # Resize re-renders the image to fit
         self.top.bind("<Configure>", self._on_resize)
@@ -2672,6 +3522,15 @@ class PreviewWindow:
             bg=self.BG2, fg=self.FG, anchor=tk.W
         )
         self._filename_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+
+        self._trash_btn = tk.Label(
+            nav_frame, text="  🗑  ", font=("Segoe UI", 14), cursor="hand2",
+            bg=self.BG2, fg=DuplicateFinderApp.DANGER, padx=8, pady=4
+        )
+        self._trash_btn.pack(side=tk.RIGHT)
+        self._trash_btn.bind("<Button-1>", lambda e: self._delete_current())
+        self._trash_btn.bind("<Enter>", lambda e: self._trash_btn.config(bg=DuplicateFinderApp.DANGER, fg="#fff"))
+        self._trash_btn.bind("<Leave>", lambda e: self._trash_btn.config(bg=self.BG2, fg=DuplicateFinderApp.DANGER))
 
         # Bottom: metadata bar
         self._meta_label = tk.Label(
@@ -2811,6 +3670,42 @@ class PreviewWindow:
                 self.top.after_cancel(self._resize_after_id)
             self._resize_after_id = self.top.after(50, self._render_image)
 
+    def _delete_current(self) -> None:
+        """Delete the currently displayed file."""
+        if not self.paths:
+            return
+        path = self.paths[self.current_index]
+        name = Path(path).name
+        if not messagebox.askyesno("Confirm Delete", f"Delete '{name}'?", parent=self.top):
+            return
+        try:
+            safe_delete(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not delete: {e}", parent=self.top)
+            return
+        # Remove from cached images
+        if self.current_index in self._pil_images:
+            try:
+                self._pil_images[self.current_index].close()
+            except Exception:
+                pass
+            del self._pil_images[self.current_index]
+        deleted_path = self.paths.pop(self.current_index)
+        # Rebuild image cache keys
+        new_cache: Dict[int, Image.Image] = {}
+        for k, v in self._pil_images.items():
+            new_key = k if k < self.current_index else k - 1
+            new_cache[new_key] = v
+        self._pil_images = new_cache
+        if not self.paths:
+            self._on_close()
+        else:
+            if self.current_index >= len(self.paths):
+                self.current_index = len(self.paths) - 1
+            self._show_current()
+        if self._on_delete:
+            self._on_delete(deleted_path)
+
     def _on_close(self) -> None:
         """Cleanup on window close."""
         # Close cached PIL images
@@ -2827,12 +3722,14 @@ class PreviewWindow:
 class ComparisonWindow:
     """Window for comparing two files side by side."""
 
-    def __init__(self, parent: tk.Tk, paths: List[str]):
+    def __init__(self, parent: tk.Tk, paths: List[str], on_delete: Optional[Callable] = None):
         self.top = tk.Toplevel(parent)
         self.top.title("Compare")
         self.top.geometry("800x500")
         self.top.configure(bg=DuplicateFinderApp.BG_DARK)
         self._image_refs: List[ImageTk.PhotoImage] = []
+        self._on_delete = on_delete
+        self._paths = paths
 
         if len(paths) < 2:
             self.top.destroy()
@@ -2847,7 +3744,37 @@ class ComparisonWindow:
         self._add_panel(left, paths[0], "File A")
         self._add_panel(right, paths[1], "File B")
 
+        # Delete buttons
+        del_frame = ttk.Frame(self.top)
+        del_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+        ttk.Button(
+            del_frame, text="Delete A", command=lambda: self._delete_file(0),
+            style="Danger.TButton"
+        ).pack(side=tk.LEFT, padx=10)
+        ttk.Button(
+            del_frame, text="Delete B", command=lambda: self._delete_file(1),
+            style="Danger.TButton"
+        ).pack(side=tk.RIGHT, padx=10)
+
         self.top.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _delete_file(self, index: int) -> None:
+        """Delete file A (index=0) or file B (index=1)."""
+        if index >= len(self._paths):
+            return
+        path = self._paths[index]
+        name = Path(path).name
+        label = "A" if index == 0 else "B"
+        if not messagebox.askyesno("Confirm Delete", f"Delete File {label}: '{name}'?", parent=self.top):
+            return
+        try:
+            safe_delete(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not delete: {e}", parent=self.top)
+            return
+        self._on_close()
+        if self._on_delete:
+            self._on_delete(path)
 
     def _on_close(self) -> None:
         self._image_refs.clear()
@@ -2919,10 +3846,232 @@ class ComparisonWindow:
 # =============================================================================
 
 def main() -> None:
-    """Main entry point."""
-    root = tk.Tk()
-    DuplicateFinderApp(root)
-    root.mainloop()
+    """Main entry point — CLI with argparse or GUI."""
+    parser = argparse.ArgumentParser(
+        prog="vkscan",
+        description="VKScan \u2014 Voight-Kampff Scanner for duplicate files"
+    )
+    parser.add_argument(
+        "--scan", nargs="+", metavar="PATH",
+        help="Scan one or more directories for duplicates (CLI mode)"
+    )
+    parser.add_argument(
+        "-o", "--output", metavar="FILE",
+        help="Export results to FILE (.csv, .txt, or .json)"
+    )
+    parser.add_argument(
+        "--no-perceptual", action="store_true",
+        help="Skip perceptual (image similarity) hashing"
+    )
+    parser.add_argument(
+        "--exclude", action="append", metavar="PATTERN",
+        help="Exclude paths matching PATTERN (repeatable)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help=f"Number of worker threads (default: {DEFAULT_WORKERS})"
+    )
+    parser.add_argument(
+        "--threshold", type=int, default=None,
+        help=f"Perceptual hash distance threshold (default: {PHASH_DISTANCE_THRESHOLD})"
+    )
+    parser.add_argument(
+        "--delete", action="store_true",
+        help="Delete duplicates (keeps oldest file in each exact group). Requires --confirm"
+    )
+    parser.add_argument(
+        "--move-to", metavar="DIR",
+        help="Move duplicates to DIR (keeps oldest file in each exact group). Requires --confirm"
+    )
+    parser.add_argument(
+        "--confirm", action="store_true",
+        help="Required with --delete or --move-to to prevent accidental data loss"
+    )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"VKScan v{VERSION}"
+    )
+
+    args = parser.parse_args()
+
+    # --- GUI mode (no --scan) ---
+    if args.scan is None:
+        # Use TkinterDnD.Tk if available for native drag-and-drop support
+        if HAS_DND:
+            root = TkinterDnD.Tk()
+        else:
+            root = tk.Tk()
+        DuplicateFinderApp(root)
+        root.mainloop()
+        return
+
+    # --- CLI mode ---
+    # Validate --delete / --move-to require --confirm
+    if (args.delete or args.move_to) and not args.confirm:
+        print("Error: --delete and --move-to require --confirm flag for safety.", file=sys.stderr)
+        print("  Example: vkscan --scan /path --delete --confirm", file=sys.stderr)
+        sys.exit(1)
+
+    if args.delete and args.move_to:
+        print("Error: --delete and --move-to are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.move_to and not os.path.isdir(args.move_to):
+        try:
+            os.makedirs(args.move_to, exist_ok=True)
+            print(f"Created destination directory: {args.move_to}")
+        except OSError as e:
+            print(f"Error: Cannot create destination directory: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Apply config overrides
+    if args.workers is not None:
+        _config.workers = max(1, args.workers)
+    if args.threshold is not None:
+        _config.image_similarity_threshold = max(0, args.threshold)
+
+    # Build exclusions
+    exclusions: Set[str] = set()
+    for line in DEFAULT_EXCLUSIONS.splitlines():
+        stripped = line.strip()
+        if stripped:
+            exclusions.add(stripped)
+    if args.exclude:
+        for pattern in args.exclude:
+            exclusions.add(pattern.strip())
+
+    perceptual = not args.no_perceptual
+
+    # Validate paths
+    valid_paths = []
+    for p in args.scan:
+        resolved = str(Path(p).resolve())
+        if os.path.isdir(resolved):
+            valid_paths.append(resolved)
+        else:
+            print(f"Warning: '{p}' is not a valid directory, skipping.")
+    if not valid_paths:
+        print("Error: No valid directories to scan.")
+        sys.exit(1)
+
+    # Progress callback for CLI
+    def cli_progress(percent: int, message: str) -> None:
+        print(f"\r[{percent:3d}%] {message}", end="", flush=True)
+
+    print(f"VKScan v{VERSION} \u2014 CLI Mode")
+    print(f"Scanning: {', '.join(valid_paths)}")
+    print(f"Workers: {_config.workers} | Perceptual: {perceptual} | Threshold: {_config.image_similarity_threshold}")
+    print()
+
+    scanner = DuplicateScanner(progress_callback=cli_progress)
+    start_time = time.time()
+
+    # Collect files
+    files = scanner.collect_files(valid_paths, exclusions)
+    print()  # newline after progress
+    print(f"Collected {len(files)} files.")
+
+    # Find duplicates
+    groups = scanner.find_duplicates(files, perceptual_images=perceptual)
+    elapsed = time.time() - start_time
+    print()  # newline after progress
+
+    # --- Print results ---
+    if not groups:
+        print("\nNo duplicates found.")
+    else:
+        total_recoverable = 0
+        print(f"\n{'=' * 60}")
+        print(f"  DUPLICATE GROUPS FOUND: {len(groups)}")
+        print(f"{'=' * 60}\n")
+
+        for i, group in enumerate(groups, 1):
+            recoverable = group.recoverable_size()
+            total_recoverable += recoverable
+            type_str = "similar" if group.is_perceptual else "exact"
+            verified_str = " [verified]" if group.verified else ""
+            print(f"Group {i} ({type_str}, {group.similarity:.1f}%{verified_str})  "
+                  f"\u2014 {len(group.files)} files, recoverable: {format_size(recoverable)}")
+            for fi in group.files:
+                mtime_str = datetime.fromtimestamp(fi.mtime).strftime(
+                    "%Y-%m-%d %H:%M"
+                ) if fi.mtime else ""
+                print(f"    {fi.path}  ({format_size(fi.size)}, {mtime_str})")
+            print()
+
+        print(f"{'=' * 60}")
+        print(f"  Total duplicate groups : {len(groups)}")
+        print(f"  Total recoverable space: {format_size(total_recoverable)}")
+        print(f"  Scan time              : {elapsed:.1f}s")
+        print(f"{'=' * 60}")
+
+    # --- Export if requested ---
+    if args.output:
+        out = args.output
+        try:
+            lower = out.lower()
+            if lower.endswith(".csv"):
+                export_csv(out, groups)
+            elif lower.endswith(".json"):
+                export_json(out, groups)
+            else:
+                export_txt(out, groups)
+            print(f"\nReport saved to: {out}")
+        except (PermissionError, OSError) as e:
+            print(f"\nError: Could not write report: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # --- Delete or move duplicates if requested ---
+    if groups and (args.delete or args.move_to):
+        # Only act on exact (100% verified) groups for safety
+        exact_groups = [g for g in groups if g.verified and g.similarity == 100.0]
+        if not exact_groups:
+            print("\nNo exact-match groups found. Skipping delete/move (only acts on verified 100% duplicates).")
+        else:
+            action = "delete" if args.delete else f"move to {args.move_to}"
+            # Collect files to remove (keep oldest in each group)
+            to_remove = []
+            for group in exact_groups:
+                sorted_files = sorted(group.files, key=lambda f: f.mtime)
+                # Keep the oldest (first), remove the rest
+                to_remove.extend(sorted_files[1:])
+
+            print(f"\n{'=' * 60}")
+            print(f"  ACTION: {action.upper()}")
+            print(f"  Groups: {len(exact_groups)} exact-match groups")
+            print(f"  Files to {action}: {len(to_remove)}")
+            print(f"  Space to recover: {format_size(sum(f.size for f in to_remove))}")
+            print(f"{'=' * 60}")
+
+            deleted = 0
+            errors = []
+
+            for fi in to_remove:
+                try:
+                    if args.delete:
+                        safe_delete(fi.path)
+                    else:
+                        dest_path = os.path.join(args.move_to, os.path.basename(fi.path))
+                        # Handle name collisions in destination
+                        if os.path.exists(dest_path):
+                            base, ext = os.path.splitext(os.path.basename(fi.path))
+                            counter = 1
+                            while os.path.exists(dest_path):
+                                dest_path = os.path.join(args.move_to, f"{base}_{counter}{ext}")
+                                counter += 1
+                        shutil.move(fi.path, dest_path)
+                    deleted += 1
+                except (PermissionError, OSError) as e:
+                    errors.append(f"  {fi.path}: {e}")
+
+            verb = "Deleted" if args.delete else "Moved"
+            print(f"\n{verb} {deleted} / {len(to_remove)} files.")
+            if errors:
+                print(f"\nErrors ({len(errors)}):")
+                for err in errors[:10]:
+                    print(err)
+                if len(errors) > 10:
+                    print(f"  ... and {len(errors) - 10} more")
 
 
 if __name__ == "__main__":
