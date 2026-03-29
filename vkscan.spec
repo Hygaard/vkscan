@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec file for VKScan v1.1.9
+# PyInstaller spec file for VKScan v1.2.0
 
 block_cipher = None
 

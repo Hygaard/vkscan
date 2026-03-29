@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.1.9
+VKScan with GUI - v1.2.0
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.1.9
+Version: 1.2.0
 """
 
 import os
@@ -57,12 +57,38 @@ try:
 except ImportError:
     HAS_DND = False
 
+# Optional: document text extraction libraries
+try:
+    import pdfplumber
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+try:
+    import docx as python_docx
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    import openpyxl
+    HAS_XLSX = True
+except ImportError:
+    HAS_XLSX = False
+
+try:
+    from odf import text as odf_text
+    from odf.opendocument import load as odf_load
+    HAS_ODF = True
+except ImportError:
+    HAS_ODF = False
+
 # =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
 
 # Version
-VERSION = "1.1.9"
+VERSION = "1.2.0"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -94,6 +120,25 @@ IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp",
     ".tiff", ".tif", ".webp", ".ico"
 }
+
+# Supported document extensions for text-based similarity comparison
+DOCUMENT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".log", ".json", ".xml", ".html", ".htm",
+    ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".cs", ".rb",
+    ".go", ".rs", ".sh", ".bat", ".ps1", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".conf", ".sql", ".r", ".tex",
+    ".pdf",
+    ".docx", ".doc",
+    ".xlsx", ".xls",
+    ".odt", ".ods",
+    ".rtf",
+}
+
+# SimHash configuration for document similarity
+SIMHASH_BITS = 128  # 128-bit fingerprint
+SIMHASH_NGRAM_SIZE = 3  # 3-word shingles
+SIMHASH_DISTANCE_THRESHOLD = 20  # Hamming distance threshold for 128-bit hash
+# 20/128 = 15.6% tolerance — catches copy-paste with edits, not rewrites
 
 # Platform-aware default exclusions
 if sys.platform == "win32":
@@ -370,7 +415,9 @@ class FileInfo:
     size: int
     hash: str = ""
     p_hash: Optional[str] = None
+    d_hash: Optional[str] = None  # SimHash for document similarity
     is_image: bool = False
+    is_document: bool = False
     inode: Optional[Tuple[int, int]] = None  # (inode, device) for hard link detection
     mtime: float = 0.0  # Last modification time (epoch)
 
@@ -403,6 +450,7 @@ class ScanOptions:
     paths: List[str]
     exclusions: Set[str]
     perceptual: bool = True
+    document_similarity: bool = True
 
 
 @dataclass
@@ -474,6 +522,129 @@ def safe_delete(path: str) -> None:
         send2trash(path)
     else:
         os.remove(path)
+
+
+# =============================================================================
+# DOCUMENT TEXT EXTRACTION & SIMHASH
+# =============================================================================
+
+def extract_text(path: str, max_chars: int = 100_000) -> Optional[str]:
+    """Extract plain text from a document file.
+
+    Supports: plain text files, PDF, DOCX, XLSX, ODS.
+    Returns None if extraction fails or no text found.
+    Truncates to max_chars to bound memory usage.
+    """
+    ext = Path(path).suffix.lower()
+
+    try:
+        # Plain text / code files
+        if ext in {".txt", ".md", ".csv", ".log", ".json", ".xml", ".html", ".htm",
+                   ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".cs", ".rb",
+                   ".go", ".rs", ".sh", ".bat", ".ps1", ".yaml", ".yml", ".toml",
+                   ".ini", ".cfg", ".conf", ".sql", ".r", ".tex", ".rtf"}:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read(max_chars)
+
+        # PDF
+        if ext == ".pdf" and HAS_PDF:
+            text_parts = []
+            with pdfplumber.open(path) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+                    if sum(len(t) for t in text_parts) >= max_chars:
+                        break
+            return "\n".join(text_parts)[:max_chars] if text_parts else None
+
+        # DOCX
+        if ext in (".docx", ".doc") and HAS_DOCX:
+            doc = python_docx.Document(path)
+            text_parts = [p.text for p in doc.paragraphs if p.text]
+            return "\n".join(text_parts)[:max_chars] if text_parts else None
+
+        # XLSX
+        if ext in (".xlsx", ".xls") and HAS_XLSX:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            text_parts = []
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(values_only=True):
+                    cells = [str(c) for c in row if c is not None]
+                    if cells:
+                        text_parts.append(" ".join(cells))
+                    if sum(len(t) for t in text_parts) >= max_chars:
+                        break
+            wb.close()
+            return "\n".join(text_parts)[:max_chars] if text_parts else None
+
+        # ODS (OpenDocument Spreadsheet/Text)
+        if ext in (".odt", ".ods") and HAS_ODF:
+            doc = odf_load(path)
+            text_parts = []
+            for element in doc.getElementsByType(odf_text.P):
+                content = element.__str__()
+                if content:
+                    text_parts.append(content)
+            return "\n".join(text_parts)[:max_chars] if text_parts else None
+
+    except Exception:
+        return None
+
+    return None
+
+
+def compute_simhash(text: str, hash_bits: int = SIMHASH_BITS,
+                    ngram_size: int = SIMHASH_NGRAM_SIZE) -> Optional[str]:
+    """Compute SimHash fingerprint of text content.
+
+    SimHash works by:
+    1. Splitting text into overlapping word n-grams (shingles)
+    2. Hashing each shingle with SHA-256
+    3. Weighting bit positions (+1/-1) across all shingle hashes
+    4. Collapsing into a final fingerprint where each bit = majority vote
+
+    The result is a locality-sensitive hash: similar text produces
+    similar hashes (small Hamming distance), unlike SHA-256 which
+    avalanches on any change.
+
+    Returns hex-encoded hash string, or None if text is too short.
+    """
+    # Normalize: lowercase, collapse whitespace
+    words = text.lower().split()
+    if len(words) < ngram_size:
+        return None
+
+    # Build shingles (overlapping n-grams)
+    shingles = []
+    for i in range(len(words) - ngram_size + 1):
+        shingle = " ".join(words[i:i + ngram_size])
+        shingles.append(shingle)
+
+    if not shingles:
+        return None
+
+    # Weighted bit vector
+    bit_counts = [0] * hash_bits
+
+    for shingle in shingles:
+        # Hash each shingle to get uniformly distributed bits
+        h = hashlib.sha256(shingle.encode("utf-8")).hexdigest()
+        h_int = int(h, 16)
+        for bit_pos in range(hash_bits):
+            if h_int & (1 << bit_pos):
+                bit_counts[bit_pos] += 1
+            else:
+                bit_counts[bit_pos] -= 1
+
+    # Collapse to fingerprint: 1 if positive, 0 if negative
+    fingerprint = 0
+    for bit_pos in range(hash_bits):
+        if bit_counts[bit_pos] > 0:
+            fingerprint |= (1 << bit_pos)
+
+    hex_chars = hash_bits // 4
+    return format(fingerprint, f'0{hex_chars}x')
 
 
 # =============================================================================
@@ -739,6 +910,10 @@ class DuplicateScanner:
         """Check if file is an image based on extension."""
         return Path(path).suffix.lower() in IMAGE_EXTENSIONS
 
+    def is_document(self, path: str) -> bool:
+        """Check if file is a document that supports text extraction."""
+        return Path(path).suffix.lower() in DOCUMENT_EXTENSIONS
+
     def compute_quick_hash(self, path: str, mtime: float = 0, size: int = 0) -> Optional[str]:
         """Compute a fast hash of the first 4KB of a file for quick-reject.
 
@@ -847,6 +1022,26 @@ class DuplicateScanner:
         except Exception:
             return None
 
+    def compute_document_hash(self, path: str) -> Optional[str]:
+        """Compute SimHash fingerprint of a document file.
+
+        Extracts text content and produces a locality-sensitive hash.
+        Similar documents produce hashes with small Hamming distance.
+
+        Args:
+            path: Path to document file
+
+        Returns:
+            Hex-encoded SimHash or None on error/no text
+        """
+        try:
+            text = extract_text(path)
+            if not text or len(text.split()) < SIMHASH_NGRAM_SIZE:
+                return None
+            return compute_simhash(text)
+        except Exception:
+            return None
+
     def collect_files(
         self,
         root_paths: List[str],
@@ -915,6 +1110,7 @@ class DuplicateScanner:
                             path=path_str,
                             size=stat.st_size,
                             is_image=self.is_image(path_str),
+                            is_document=self.is_document(path_str),
                             inode=inode_key,
                             mtime=stat.st_mtime
                         ))
@@ -968,6 +1164,7 @@ class DuplicateScanner:
         self,
         files: List[FileInfo],
         perceptual_images: bool = True,
+        document_similarity: bool = True,
         group_callback: Optional[Callable[[DuplicateGroup], None]] = None
     ) -> List[DuplicateGroup]:
         """Find duplicate files using hashing and byte-level verification.
@@ -1122,6 +1319,13 @@ class DuplicateScanner:
                 files, duplicate_groups, workers, group_callback
             )
             duplicate_groups.extend(perceptual_groups)
+
+        # --- Stage 5: Document similarity (SimHash) ---
+        if document_similarity and not self.cancelled:
+            doc_groups = self._find_document_duplicates(
+                files, duplicate_groups, workers, group_callback
+            )
+            duplicate_groups.extend(doc_groups)
 
         self._update_progress(100, "Scan complete!")
         return duplicate_groups
@@ -1291,6 +1495,177 @@ class DuplicateScanner:
                     if not already_grouped:
                         dg = DuplicateGroup(
                             files=img_files,
+                            similarity=100.0,
+                            is_perceptual=True
+                        )
+                        duplicate_groups.append(dg)
+                        if group_callback:
+                            group_callback(dg)
+
+        return duplicate_groups
+
+    def _find_document_duplicates(
+        self,
+        files: List[FileInfo],
+        existing_groups: List[DuplicateGroup],
+        workers: int,
+        group_callback: Optional[Callable[[DuplicateGroup], None]] = None
+    ) -> List[DuplicateGroup]:
+        """Find similar documents using SimHash fingerprinting.
+
+        Extracts text from documents, computes SimHash, then uses BK-tree
+        to find pairs with small Hamming distance (similar content).
+        """
+        duplicate_groups: List[DuplicateGroup] = []
+
+        # Exclude files already in exact duplicate groups
+        exact_dup_paths = {
+            f.path
+            for dg in existing_groups
+            if not dg.is_perceptual
+            for f in dg.files
+        }
+
+        doc_files = [
+            f for f in files
+            if f.is_document and f.path not in exact_dup_paths
+        ]
+
+        if not doc_files or self.cancelled:
+            return duplicate_groups
+
+        # Parallel document hashing
+        self._update_progress(85, f"STAGE:5/5:Document Similarity|0|Document hashes: 0 / {len(doc_files):,} ({workers} threads)")
+        dhash_groups: Dict[str, List[FileInfo]] = defaultdict(list)
+        processed = 0
+        last_update = time.monotonic()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_file = {
+                pool.submit(self.compute_document_hash, fi.path): fi
+                for fi in doc_files
+            }
+
+            for future in as_completed(future_to_file):
+                if self.cancelled:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+
+                fi = future_to_file[future]
+                try:
+                    dh = future.result()
+                except Exception:
+                    dh = None
+
+                if dh:
+                    fi.d_hash = dh
+                    dhash_groups[dh].append(fi)
+                processed += 1
+
+                now = time.monotonic()
+                if now - last_update > 0.1:
+                    last_update = now
+                    stage_pct = int((processed / len(doc_files)) * 80)
+                    self._update_progress(
+                        85 + int((processed / len(doc_files)) * 10),
+                        f"STAGE:5/5:Document Similarity|{stage_pct}|Document hashes: {processed:,} / {len(doc_files):,} ({workers} threads)"
+                    )
+
+        if not self.cancelled and dhash_groups:
+            self._update_progress(95, "STAGE:5/5:Document Similarity|80|Finding similar documents...")
+
+            hash_keys = sorted(dhash_groups.keys())
+            total_hashes = len(hash_keys)
+            merged_groups: Set[str] = set()
+
+            bk_tree = BKTree()
+            for dh in hash_keys:
+                bk_tree.insert(dh)
+
+            last_update = time.monotonic()
+
+            for i, dh1 in enumerate(hash_keys):
+                if self.cancelled:
+                    break
+
+                if dh1 in merged_groups:
+                    continue
+
+                files1 = dhash_groups[dh1]
+                if not files1:
+                    continue
+
+                neighbors = bk_tree.find_within(dh1, SIMHASH_DISTANCE_THRESHOLD)
+                similar = sorted([(nh, d) for nh, d in neighbors
+                                  if d > 0 and nh not in merged_groups and nh > dh1])
+
+                for dh2, distance in similar:
+                    if self.cancelled:
+                        break
+
+                    if dh2 in merged_groups:
+                        continue
+
+                    files2 = dhash_groups[dh2]
+                    if not files2:
+                        continue
+
+                    similarity = calculate_similarity(distance, max_bits=SIMHASH_BITS)
+                    combined = files1 + files2
+
+                    combined_paths = {f.path for f in combined}
+                    already_grouped = False
+
+                    for dg in duplicate_groups:
+                        dg_paths = {f.path for f in dg.files}
+                        if combined_paths & dg_paths:
+                            already_grouped = True
+                            break
+
+                    if not already_grouped:
+                        dg = DuplicateGroup(
+                            files=combined,
+                            similarity=similarity,
+                            is_perceptual=True  # Marks as non-exact (similar)
+                        )
+                        duplicate_groups.append(dg)
+                        if group_callback:
+                            group_callback(dg)
+
+                    merged_groups.add(dh1)
+                    merged_groups.add(dh2)
+                    dhash_groups[dh2] = []
+
+                now = time.monotonic()
+                if now - last_update > 0.1:
+                    last_update = now
+                    stage_pct = 80 + int((i / max(total_hashes, 1)) * 20)
+                    self._update_progress(
+                        95 + int((i / max(total_hashes, 1)) * 5),
+                        f"STAGE:5/5:Document Similarity|{stage_pct}|Comparing: {i:,} / {total_hashes:,} hashes"
+                    )
+
+            # Exact SimHash matches (same hash, different files)
+            for dh, doc_files_group in dhash_groups.items():
+                if self.cancelled:
+                    break
+
+                if dh in merged_groups:
+                    continue
+
+                if len(doc_files_group) >= 2:
+                    doc_paths = {f.path for f in doc_files_group}
+                    already_grouped = False
+
+                    for dg in duplicate_groups:
+                        dg_paths = {f.path for f in dg.files}
+                        if doc_paths & dg_paths:
+                            already_grouped = True
+                            break
+
+                    if not already_grouped:
+                        dg = DuplicateGroup(
+                            files=doc_files_group,
                             similarity=100.0,
                             is_perceptual=True
                         )
@@ -2205,6 +2580,7 @@ class DuplicateFinderApp:
                 if not self.scanner.cancelled:
                     self.duplicate_groups = self.scanner.find_duplicates(
                         files, options.perceptual,
+                        document_similarity=options.document_similarity,
                         group_callback=group_callback
                     )
 
@@ -3276,9 +3652,16 @@ class ScanDialog:
         self.perceptual_var = tk.BooleanVar(value=_saved_scan_perceptual)
         ttk.Checkbutton(
             content,
-            text="Perceptual image comparison (slower but finds similar images)",
+            text="Perceptual image comparison (finds similar images)",
             variable=self.perceptual_var
-        ).pack(anchor=tk.W, pady=5)
+        ).pack(anchor=tk.W, pady=2)
+
+        self.docsim_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            content,
+            text="Document similarity (finds similar text/PDF/Office files)",
+            variable=self.docsim_var
+        ).pack(anchor=tk.W, pady=2)
 
         # Action buttons
         action_frame = ttk.Frame(content)
@@ -3390,7 +3773,8 @@ class ScanDialog:
         self.result = ScanOptions(
             paths=paths,
             exclusions=exclusions,
-            perceptual=self.perceptual_var.get()
+            perceptual=self.perceptual_var.get(),
+            document_similarity=self.docsim_var.get()
         )
         self.top.destroy()
 
@@ -3920,6 +4304,10 @@ def main() -> None:
         help="Skip perceptual (image similarity) hashing"
     )
     parser.add_argument(
+        "--no-documents", action="store_true",
+        help="Skip document similarity comparison"
+    )
+    parser.add_argument(
         "--exclude", action="append", metavar="PATTERN",
         help="Exclude paths matching PATTERN (repeatable)"
     )
@@ -3998,6 +4386,7 @@ def main() -> None:
             exclusions.add(pattern.strip())
 
     perceptual = not args.no_perceptual
+    doc_similarity = not args.no_documents
 
     # Validate paths
     valid_paths = []
@@ -4029,7 +4418,7 @@ def main() -> None:
     print(f"Collected {len(files)} files.")
 
     # Find duplicates
-    groups = scanner.find_duplicates(files, perceptual_images=perceptual)
+    groups = scanner.find_duplicates(files, perceptual_images=perceptual, document_similarity=doc_similarity)
     elapsed = time.time() - start_time
     print()  # newline after progress
 
