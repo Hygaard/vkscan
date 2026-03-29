@@ -122,16 +122,16 @@ jobs:
 
       - name: Rename platform binaries
         run: |
-          mv VKScan-Windows/VKScan.exe VKScan-Windows.exe
-          mv VKScan-Linux/VKScan VKScan-Linux
-          mv VKScan-macOS/VKScan VKScan-macOS
+          mv VKScan-Windows/VKScan.exe ./VKScan-Windows.exe
+          mv VKScan-Linux/VKScan ./VKScan-Linux-x86_64
+          mv VKScan-macOS/VKScan ./VKScan-macOS-arm64
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             VKScan-Windows.exe
-            VKScan-Linux
-            VKScan-macOS
+            VKScan-Linux-x86_64
+            VKScan-macOS-arm64
           generate_release_notes: true
           draft: false

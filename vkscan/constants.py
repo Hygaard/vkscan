@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Version
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels
