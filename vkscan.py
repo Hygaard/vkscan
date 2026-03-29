@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.1.6
+VKScan with GUI - v1.1.7
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.1.6
+Version: 1.1.7
 """
 
 import os
@@ -62,7 +62,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -205,6 +205,7 @@ class HashCache:
 
     def __init__(self, db_path: Path = CACHE_DB):
         self._lock = threading.Lock()
+        self._db_path = db_path
         try:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -319,6 +320,20 @@ class HashCache:
             except Exception:
                 pass
 
+    def close_and_delete(self) -> None:
+        """Close the database and delete the cache file."""
+        self.close()
+        try:
+            if self._db_path.exists():
+                self._db_path.unlink()
+            # WAL mode creates -wal and -shm sidecar files
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(self._db_path) + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+        except Exception:
+            pass
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -334,6 +349,14 @@ def get_hash_cache() -> HashCache:
     if _hash_cache is None:
         _hash_cache = HashCache()
     return _hash_cache
+
+
+def cleanup_hash_cache() -> None:
+    """Close and delete the hash cache. Call on application exit."""
+    global _hash_cache
+    if _hash_cache is not None:
+        _hash_cache.close_and_delete()
+        _hash_cache = None
 
 
 # =============================================================================
@@ -1304,9 +1327,6 @@ class DuplicateFinderApp:
         self._last_scan_options: Optional[ScanOptions] = None
         self._stage_start_time: Optional[float] = None
         self._current_stage_key: str = ""
-        self._last_eta_pct: int = 0
-        self._last_eta_time: float = 0.0
-        self._eta_rate: float = 0.0  # EMA of pct/sec
         self._detached_items: Dict[str, Tuple[str, int]] = {}  # Filter: item_id -> (parent, index)
 
         load_settings()
@@ -2281,38 +2301,20 @@ class DuplicateFinderApp:
                         header, stage_pct_str, detail = latest_message[6:].split("|", 2)
                         stage_num_str, stage_name = header.split(":", 1)
                         stage_pct = int(stage_pct_str)
-                        # ETA computation using exponential moving average of throughput.
-                        # This adapts to changing speeds (e.g. small files fast, big files slow)
-                        # instead of assuming linear progress from start.
+                        # Show elapsed time for the current stage
                         if stage_num_str != self._current_stage_key:
                             self._current_stage_key = stage_num_str
                             self._stage_start_time = time.monotonic()
-                            self._last_eta_pct = 0
-                            self._last_eta_time = time.monotonic()
-                            self._eta_rate = 0.0
-                        now_t = time.monotonic()
-                        if stage_pct > self._last_eta_pct and stage_pct > 2:
-                            dt = now_t - self._last_eta_time
-                            dpct = stage_pct - self._last_eta_pct
-                            if dt > 0.5 and dpct > 0:
-                                current_rate = dpct / dt  # pct per second
-                                if self._eta_rate <= 0:
-                                    self._eta_rate = current_rate
+                        if self._stage_start_time is not None:
+                            elapsed = time.monotonic() - self._stage_start_time
+                            if elapsed >= 2.0:
+                                if elapsed < 60:
+                                    elapsed_str = f"{int(elapsed)}s"
+                                elif elapsed < 3600:
+                                    elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
                                 else:
-                                    # EMA with alpha=0.3 — recent speed weighted 30%
-                                    self._eta_rate = 0.3 * current_rate + 0.7 * self._eta_rate
-                                self._last_eta_pct = stage_pct
-                                self._last_eta_time = now_t
-                        if self._eta_rate > 0 and stage_pct < 100:
-                            remaining_pct = 100 - stage_pct
-                            eta_seconds = remaining_pct / self._eta_rate
-                            if eta_seconds < 60:
-                                eta_str = f"{int(eta_seconds)}s"
-                            elif eta_seconds < 3600:
-                                eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
-                            else:
-                                eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m"
-                            detail = f"{detail}  (ETA: ~{eta_str})"
+                                    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
+                                detail = f"{detail}  ({elapsed_str} elapsed)"
                         self.stage_label.config(text=f"Stage {stage_num_str}: {stage_name}")
                         self.progress_var.set(stage_pct)
                         self.detail_label.config(text=detail)
@@ -3918,6 +3920,7 @@ def main() -> None:
             root = tk.Tk()
         DuplicateFinderApp(root)
         root.mainloop()
+        cleanup_hash_cache()
         return
 
     # --- CLI mode ---
@@ -4087,6 +4090,8 @@ def main() -> None:
                     print(err)
                 if len(errors) > 10:
                     print(f"  ... and {len(errors) - 10} more")
+
+    cleanup_hash_cache()
 
 
 if __name__ == "__main__":
