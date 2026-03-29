@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.1.2
+VKScan with GUI - v1.1.3
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.1.2
+Version: 1.1.3
 """
 
 import os
@@ -62,7 +62,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -1172,9 +1172,15 @@ class DuplicateScanner:
             self._update_progress(80, "STAGE:4/4:Verifying|80|Finding similar images...")
 
             hash_keys = sorted(phash_groups.keys())
-            num_pairs = len(hash_keys) * (len(hash_keys) - 1) // 2
-            pair_count = 0
+            total_hashes = len(hash_keys)
             merged_groups: Set[str] = set()
+
+            # Build BK-tree for O(n log n) neighbor search instead of O(n^2) all-pairs.
+            # The matching logic below is identical to the v1.0.0 O(n^2) algorithm:
+            # same sorted iteration order, same per-pair grouping, same merged_groups behavior.
+            bk_tree = BKTree()
+            for ph in hash_keys:
+                bk_tree.insert(ph)
 
             last_update = time.monotonic()
 
@@ -1189,55 +1195,57 @@ class DuplicateScanner:
                 if not files1:
                     continue
 
-                for j, ph2 in enumerate(hash_keys[i + 1:], i + 1):
+                # BK-tree query replaces the inner loop — finds all hashes within threshold
+                # Filter to only those after ph1 in sorted order (same as j > i in old code)
+                neighbors = bk_tree.find_within(ph1, _config.image_similarity_threshold)
+                similar = sorted([(nh, d) for nh, d in neighbors
+                                  if d > 0 and nh not in merged_groups and nh > ph1])
+
+                for ph2, distance in similar:
                     if self.cancelled:
                         break
 
                     if ph2 in merged_groups:
                         continue
 
-                    pair_count += 1
-                    distance = hamming_distance(ph1, ph2)
+                    files2 = phash_groups[ph2]
+                    if not files2:
+                        continue
 
-                    if 0 < distance <= _config.image_similarity_threshold:
-                        files2 = phash_groups[ph2]
-                        if not files2:
-                            continue
+                    similarity = calculate_similarity(distance)
+                    combined = files1 + files2
 
-                        similarity = calculate_similarity(distance)
-                        combined = files1 + files2
+                    combined_paths = {f.path for f in combined}
+                    already_grouped = False
 
-                        combined_paths = {f.path for f in combined}
-                        already_grouped = False
+                    for dg in duplicate_groups:
+                        dg_paths = {f.path for f in dg.files}
+                        if combined_paths & dg_paths:
+                            already_grouped = True
+                            break
 
-                        for dg in duplicate_groups:
-                            dg_paths = {f.path for f in dg.files}
-                            if combined_paths & dg_paths:
-                                already_grouped = True
-                                break
-
-                        if not already_grouped:
-                            dg = DuplicateGroup(
-                                files=combined,
-                                similarity=similarity,
-                                is_perceptual=True
-                            )
-                            duplicate_groups.append(dg)
-                            if group_callback:
-                                group_callback(dg)
-
-                        merged_groups.add(ph1)
-                        merged_groups.add(ph2)
-                        phash_groups[ph2] = []
-
-                    now = time.monotonic()
-                    if num_pairs > 0 and now - last_update > 0.1:
-                        last_update = now
-                        stage_pct = 80 + int((pair_count / num_pairs) * 20)
-                        self._update_progress(
-                            80 + int((pair_count / num_pairs) * 15),
-                            f"STAGE:4/4:Verifying|{stage_pct}|Comparing: {pair_count:,} / {num_pairs:,} pairs"
+                    if not already_grouped:
+                        dg = DuplicateGroup(
+                            files=combined,
+                            similarity=similarity,
+                            is_perceptual=True
                         )
+                        duplicate_groups.append(dg)
+                        if group_callback:
+                            group_callback(dg)
+
+                    merged_groups.add(ph1)
+                    merged_groups.add(ph2)
+                    phash_groups[ph2] = []
+
+                now = time.monotonic()
+                if now - last_update > 0.1:
+                    last_update = now
+                    stage_pct = 80 + int((i / max(total_hashes, 1)) * 20)
+                    self._update_progress(
+                        80 + int((i / max(total_hashes, 1)) * 15),
+                        f"STAGE:4/4:Verifying|{stage_pct}|Comparing: {i:,} / {total_hashes:,} hashes"
+                    )
 
             # Exact perceptual hash matches
             for ph, img_files in phash_groups.items():
@@ -2539,6 +2547,7 @@ class DuplicateFinderApp:
             pw = PreviewWindow(self.root, paths, on_delete=self._on_preview_delete)
             self._center_dialog(pw.top, 700, 500)
             self._apply_dark_titlebar(pw.top)
+            self._set_app_icon(pw.top)
 
     def _show_preview(self) -> None:
         """Show preview of selected files, expanding to full group if single item selected."""
@@ -2557,6 +2566,7 @@ class DuplicateFinderApp:
             pw = PreviewWindow(self.root, paths, on_delete=self._on_preview_delete)
             self._center_dialog(pw.top, 700, 500)
             self._apply_dark_titlebar(pw.top)
+            self._set_app_icon(pw.top)
 
     def _compare_selected(self) -> None:
         """Compare selected files side by side."""
@@ -2565,6 +2575,7 @@ class DuplicateFinderApp:
             cw = ComparisonWindow(self.root, paths[:2], on_delete=self._on_preview_delete)
             self._center_dialog(cw.top, 900, 600)
             self._apply_dark_titlebar(cw.top)
+            self._set_app_icon(cw.top)
 
     def _delete_selected(self) -> None:
         """Delete selected files (via trash if available)."""
