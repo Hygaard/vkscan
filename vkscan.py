@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.2.1
+VKScan with GUI - v1.2.2
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.2.1
+Version: 1.2.2
 """
 
 import os
@@ -88,7 +88,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -139,6 +139,8 @@ SIMHASH_BITS = 64  # 64-bit fingerprint (stable for typical document lengths)
 SIMHASH_NGRAM_SIZE = 2  # 2-word shingles (more shingles = more stable hashes)
 SIMHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold for 64-bit hash
 # 8/64 = 12.5% tolerance — catches copy-paste with edits, not rewrites
+SIMHASH_MIN_WORDS = 100  # Minimum word count to consider a document for similarity
+# Prevents false matches on image-based PDFs that extract only boilerplate text
 
 # Platform-aware default exclusions
 if sys.platform == "win32":
@@ -1034,8 +1036,11 @@ class DuplicateScanner:
         """
         try:
             text = extract_text(path)
-            if not text or len(text.split()) < SIMHASH_NGRAM_SIZE:
+            if not text:
                 return None
+            word_count = len(text.split())
+            if word_count < SIMHASH_MIN_WORDS:
+                return None  # Too little text — likely image-based PDF or stub file
             return compute_simhash(text)
         except Exception:
             return None
