@@ -68,13 +68,9 @@ VERSION = "1.1.0"
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
 
 # Perceptual hash configuration
-# hash_size=8 produces 64-bit hashes (imagehash default, industry standard for pHash).
-# hash_size=16 (256-bit) is too sensitive — JPEG recompression alone can produce
-# distances of 100+, making threshold=8 catch almost nothing.
-# With 64-bit: threshold 8 = 12.5% tolerance, good for crops/recompression/resizes.
-PHASH_BLOCK_SIZE = 8  # Creates 8x8 = 64-bit hash
-PHASH_BIT_COUNT = PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE  # 64 bits total
-PHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold; 0=exact, 64=completely different
+PHASH_BLOCK_SIZE = 16  # Creates 16x16 = 256-bit hash (higher resolution = fewer false positives)
+PHASH_BIT_COUNT = PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE  # 256 bits total
+PHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold; 0=exact, 256=completely different
 
 # Preview configuration
 MAX_PREVIEW_SIZE = 500  # Max dimension for preview images in pixels
@@ -172,12 +168,7 @@ def load_settings() -> None:
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if "image_similarity_threshold" in data:
-            threshold = int(data["image_similarity_threshold"])
-            # v1.1.0 switched from 256-bit to 64-bit pHash. Clamp thresholds
-            # that were tuned for the old 256-bit scale to avoid false positives.
-            if threshold > PHASH_BIT_COUNT:
-                threshold = PHASH_DISTANCE_THRESHOLD  # Reset to default
-            _config.image_similarity_threshold = threshold
+            _config.image_similarity_threshold = int(data["image_similarity_threshold"])
         if "workers" in data:
             _config.workers = max(1, int(data["workers"]))
         if "use_trash" in data:
@@ -233,14 +224,15 @@ class HashCache:
             self._conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_path ON hash_cache(path)
             """)
-            # v1.1.0: pHash changed from 256-bit (hash_size=16) to 64-bit (hash_size=8).
-            # Invalidate all cached phash values so they get recomputed with the new size.
-            # Detect by checking if any cached phash is longer than 16 hex chars (64 bits).
+            # Invalidate cached phash values if they don't match current hash size.
+            # 256-bit (hash_size=16) = 64 hex chars; 64-bit (hash_size=8) = 16 hex chars.
+            # If the stored hash length doesn't match PHASH_BLOCK_SIZE**2 / 4, wipe all.
+            expected_hex_len = (PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE) // 4  # bits -> hex chars
             try:
                 sample = self._conn.execute(
                     "SELECT phash FROM hash_cache WHERE phash IS NOT NULL LIMIT 1"
                 ).fetchone()
-                if sample and len(sample[0]) > 16:
+                if sample and len(sample[0]) != expected_hex_len:
                     self._conn.execute("UPDATE hash_cache SET phash = NULL")
             except Exception:
                 pass
@@ -3379,7 +3371,7 @@ class OptionsDialog:
         ).pack()
 
         self.scale = ttk.Scale(
-            self.top, from_=0, to=32, orient=tk.HORIZONTAL,
+            self.top, from_=0, to=64, orient=tk.HORIZONTAL,
             command=self._on_scale_change
         )
         self.scale.set(_config.image_similarity_threshold)

@@ -42,6 +42,17 @@ class HashCache:
             self._conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_path ON hash_cache(path)
             """)
+            # Invalidate cached phash values if they don't match current hash size.
+            from .constants import PHASH_BLOCK_SIZE
+            expected_hex_len = (PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE) // 4
+            try:
+                sample = self._conn.execute(
+                    "SELECT phash FROM hash_cache WHERE phash IS NOT NULL LIMIT 1"
+                ).fetchone()
+                if sample and len(sample[0]) != expected_hex_len:
+                    self._conn.execute("UPDATE hash_cache SET phash = NULL")
+            except Exception:
+                pass
             self._conn.commit()
             self._enabled = True
         except Exception:
