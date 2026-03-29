@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.2.0
+VKScan with GUI - v1.2.1
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.2.0
+Version: 1.2.1
 """
 
 import os
@@ -88,7 +88,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -135,10 +135,10 @@ DOCUMENT_EXTENSIONS = {
 }
 
 # SimHash configuration for document similarity
-SIMHASH_BITS = 128  # 128-bit fingerprint
-SIMHASH_NGRAM_SIZE = 3  # 3-word shingles
-SIMHASH_DISTANCE_THRESHOLD = 20  # Hamming distance threshold for 128-bit hash
-# 20/128 = 15.6% tolerance — catches copy-paste with edits, not rewrites
+SIMHASH_BITS = 64  # 64-bit fingerprint (stable for typical document lengths)
+SIMHASH_NGRAM_SIZE = 2  # 2-word shingles (more shingles = more stable hashes)
+SIMHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold for 64-bit hash
+# 8/64 = 12.5% tolerance — catches copy-paste with edits, not rewrites
 
 # Platform-aware default exclusions
 if sys.platform == "win32":
@@ -4032,13 +4032,13 @@ class PreviewWindow:
 
         # Clear previous content
         self._image_label.config(image="", text="")
-        if self._text_widget:
-            self._text_widget.destroy()
-            self._text_widget = None
+        self._clear_text_widget()
         self._photo_ref = None
 
+        ext = Path(path).suffix.lower()
+
         # Try image
-        if Path(path).suffix.lower() in IMAGE_EXTENSIONS:
+        if ext in IMAGE_EXTENSIONS:
             try:
                 if self.current_index not in self._pil_images:
                     img = Image.open(path)
@@ -4050,24 +4050,61 @@ class PreviewWindow:
             except Exception:
                 pass
 
-        # Try text
+        # Try document text extraction (PDF, DOCX, XLSX, etc.)
+        if ext in DOCUMENT_EXTENSIONS:
+            try:
+                text = extract_text(path)
+                if text and text.strip():
+                    self._show_text_content(text)
+                    return
+            except Exception:
+                pass
+
+        # Try plain text (fallback for unknown extensions)
         try:
-            self._text_widget = scrolledtext.ScrolledText(
-                self._content_frame, wrap=tk.WORD,
-                bg=DuplicateFinderApp.BG_LIGHT, fg=self.FG,
-                insertbackground=self.FG, font=("Consolas", 10),
-                bd=0, relief="flat"
-            )
-            self._text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             with open(path, "r", errors="replace") as f:
-                lines = f.readlines()[:TEXT_PREVIEW_LINES]
-                self._text_widget.insert(1.0, "".join(lines))
-            self._text_widget.config(state=tk.DISABLED)
-            return
+                content = f.read(TEXT_PREVIEW_LINES * 200)  # rough char limit
+            if content and content.strip():
+                self._show_text_content(content)
+                return
         except Exception:
             pass
 
         self._image_label.config(text="[Binary file — cannot preview]", fg=self.FG3)
+
+    def _clear_text_widget(self) -> None:
+        """Destroy the text preview widget and its containing frame."""
+        if self._text_widget:
+            # ScrolledText is a Frame containing a Text + Scrollbar.
+            # Destroy the master frame to ensure full cleanup.
+            try:
+                master = self._text_widget.master
+                if master != self._content_frame:
+                    master.destroy()
+                else:
+                    self._text_widget.destroy()
+            except Exception:
+                try:
+                    self._text_widget.destroy()
+                except Exception:
+                    pass
+            self._text_widget = None
+
+    def _show_text_content(self, text: str) -> None:
+        """Display text content in a ScrolledText widget."""
+        self._text_widget = scrolledtext.ScrolledText(
+            self._content_frame, wrap=tk.WORD,
+            bg=DuplicateFinderApp.BG_LIGHT, fg=self.FG,
+            insertbackground=self.FG, font=("Consolas", 10),
+            bd=0, relief="flat"
+        )
+        self._text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Truncate to prevent UI freeze on huge documents
+        display_text = text[:50000]
+        if len(text) > 50000:
+            display_text += f"\n\n[... truncated, {len(text):,} chars total]"
+        self._text_widget.insert(1.0, display_text)
+        self._text_widget.config(state=tk.DISABLED)
 
     def _render_image(self) -> None:
         """Render the current PIL image scaled to fill the content area."""
