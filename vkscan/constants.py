@@ -12,9 +12,10 @@ VERSION = "1.1.0"
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels
 
 # Perceptual hash configuration
-PHASH_BLOCK_SIZE = 16  # Creates 16x16 = 256-bit hash
-PHASH_BIT_COUNT = PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE  # 256 bits total
-PHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold
+# hash_size=8 produces 64-bit hashes (imagehash default, industry standard for pHash).
+PHASH_BLOCK_SIZE = 8  # Creates 8x8 = 64-bit hash
+PHASH_BIT_COUNT = PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE  # 64 bits total
+PHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold; 0=exact, 64=completely different
 
 # Preview configuration
 MAX_PREVIEW_SIZE = 500  # Max dimension for preview images in pixels
