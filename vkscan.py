@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.2.2
+VKScan with GUI - v1.2.3
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.2.2
+Version: 1.2.3
 """
 
 import os
@@ -29,6 +29,7 @@ import queue
 import json
 import argparse
 import re
+import struct
 import sqlite3
 from pathlib import Path
 from datetime import datetime
@@ -88,7 +89,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -134,12 +135,11 @@ DOCUMENT_EXTENSIONS = {
     ".rtf",
 }
 
-# SimHash configuration for document similarity
-SIMHASH_BITS = 64  # 64-bit fingerprint (stable for typical document lengths)
-SIMHASH_NGRAM_SIZE = 2  # 2-word shingles (more shingles = more stable hashes)
-SIMHASH_DISTANCE_THRESHOLD = 8  # Hamming distance threshold for 64-bit hash
-# 8/64 = 12.5% tolerance — catches copy-paste with edits, not rewrites
-SIMHASH_MIN_WORDS = 100  # Minimum word count to consider a document for similarity
+# MinHash configuration for document similarity
+MINHASH_NUM_HASHES = 128  # Number of hash functions (higher = more accurate, slower)
+MINHASH_NGRAM_SIZE = 2  # 2-word shingles
+MINHASH_SIMILARITY_THRESHOLD = 50.0  # Minimum Jaccard similarity % to consider a match
+MINHASH_MIN_WORDS = 100  # Minimum word count to consider a document for similarity
 # Prevents false matches on image-based PDFs that extract only boilerplate text
 
 # Platform-aware default exclusions
@@ -417,7 +417,7 @@ class FileInfo:
     size: int
     hash: str = ""
     p_hash: Optional[str] = None
-    d_hash: Optional[str] = None  # SimHash for document similarity
+    d_hash: Optional[List[int]] = None  # MinHash signature for document similarity
     is_image: bool = False
     is_document: bool = False
     inode: Optional[Tuple[int, int]] = None  # (inode, device) for hard link detection
@@ -596,55 +596,61 @@ def extract_text(path: str, max_chars: int = 100_000) -> Optional[str]:
     return None
 
 
-def compute_simhash(text: str, hash_bits: int = SIMHASH_BITS,
-                    ngram_size: int = SIMHASH_NGRAM_SIZE) -> Optional[str]:
-    """Compute SimHash fingerprint of text content.
+def compute_minhash(text: str, num_hashes: int = MINHASH_NUM_HASHES,
+                    ngram_size: int = MINHASH_NGRAM_SIZE) -> Optional[List[int]]:
+    """Compute MinHash signature of text content.
 
-    SimHash works by:
-    1. Splitting text into overlapping word n-grams (shingles)
-    2. Hashing each shingle with SHA-256 (truncated to hash_bits)
-    3. Weighting bit positions (+1/-1) across all shingle hashes
-    4. Collapsing into a final fingerprint where each bit = majority vote
+    MinHash estimates Jaccard similarity between document shingle sets.
+    Each hash function picks the minimum hash value across all shingles,
+    and the fraction of matching minimums between two signatures
+    approximates their Jaccard similarity.
 
-    The result is a locality-sensitive hash: similar text produces
-    similar hashes (small Hamming distance), unlike SHA-256 which
-    avalanches on any change.
+    Uses XOR with random masks to generate multiple hash functions from
+    a single MD5 hash per shingle (fast and well-distributed).
 
-    Returns hex-encoded hash string, or None if text is too short.
+    Returns list of num_hashes minimum values, or None if text is too short.
     """
-    # Normalize: lowercase, collapse whitespace
     words = text.lower().split()
     if len(words) < ngram_size:
         return None
 
-    if len(words) - ngram_size + 1 <= 0:
-        return None
-
-    # Pre-compute bit masks for fast bit extraction
-    bit_masks = [(1 << bp) for bp in range(hash_bits)]
-
-    # Weighted bit vector
-    bit_counts = [0] * hash_bits
-
-    # Slide through shingles without building a list (saves memory for large docs)
-    mask = (1 << hash_bits) - 1  # Truncate SHA-256 to hash_bits
+    # Build unique shingle set
+    shingles = set()
     for i in range(len(words) - ngram_size + 1):
-        shingle = " ".join(words[i:i + ngram_size])
-        h_int = int(hashlib.sha256(shingle.encode("utf-8")).hexdigest(), 16) & mask
-        for bp in range(hash_bits):
-            if h_int & bit_masks[bp]:
-                bit_counts[bp] += 1
-            else:
-                bit_counts[bp] -= 1
+        shingles.add(" ".join(words[i:i + ngram_size]))
 
-    # Collapse to fingerprint: 1 if positive, 0 if negative
-    fingerprint = 0
-    for bp in range(hash_bits):
-        if bit_counts[bp] > 0:
-            fingerprint |= bit_masks[bp]
+    if len(shingles) < 10:
+        return None  # Too few unique shingles for meaningful comparison
 
-    hex_chars = hash_bits // 4
-    return format(fingerprint, f'0{hex_chars}x')
+    # Pre-generate random XOR masks (fixed seed for reproducibility)
+    import random as _rng_mod
+    rng = _rng_mod.Random(42)
+    xor_masks = [rng.getrandbits(64) for _ in range(num_hashes)]
+    max64 = (1 << 64) - 1
+
+    # Initialize signature with max values
+    signature = [max64] * num_hashes
+
+    # Single hash per shingle, XOR to get num_hashes variants
+    for shingle in shingles:
+        h = struct.unpack('<Q', hashlib.md5(shingle.encode("utf-8")).digest()[:8])[0]
+        for idx in range(num_hashes):
+            val = h ^ xor_masks[idx]
+            if val < signature[idx]:
+                signature[idx] = val
+
+    return signature
+
+
+def minhash_similarity(sig1: List[int], sig2: List[int]) -> float:
+    """Compute estimated Jaccard similarity between two MinHash signatures.
+
+    Returns percentage (0.0 to 100.0).
+    """
+    if not sig1 or not sig2 or len(sig1) != len(sig2):
+        return 0.0
+    matches = sum(1 for a, b in zip(sig1, sig2) if a == b)
+    return matches / len(sig1) * 100.0
 
 
 # =============================================================================
@@ -1022,26 +1028,26 @@ class DuplicateScanner:
         except Exception:
             return None
 
-    def compute_document_hash(self, path: str) -> Optional[str]:
-        """Compute SimHash fingerprint of a document file.
+    def compute_document_hash(self, path: str) -> Optional[List[int]]:
+        """Compute MinHash signature of a document file.
 
-        Extracts text content and produces a locality-sensitive hash.
-        Similar documents produce hashes with small Hamming distance.
+        Extracts text content and produces a MinHash signature.
+        Similar documents share many matching hash values.
 
         Args:
             path: Path to document file
 
         Returns:
-            Hex-encoded SimHash or None on error/no text
+            MinHash signature (list of ints) or None on error/no text
         """
         try:
             text = extract_text(path)
             if not text:
                 return None
             word_count = len(text.split())
-            if word_count < SIMHASH_MIN_WORDS:
+            if word_count < MINHASH_MIN_WORDS:
                 return None  # Too little text — likely image-based PDF or stub file
-            return compute_simhash(text)
+            return compute_minhash(text)
         except Exception:
             return None
 
@@ -1514,10 +1520,10 @@ class DuplicateScanner:
         workers: int,
         group_callback: Optional[Callable[[DuplicateGroup], None]] = None
     ) -> List[DuplicateGroup]:
-        """Find similar documents using SimHash fingerprinting.
+        """Find similar documents using MinHash signatures.
 
-        Extracts text from documents, computes SimHash, then uses BK-tree
-        to find pairs with small Hamming distance (similar content).
+        Extracts text from documents, computes MinHash, then compares
+        all pairs to find documents with high Jaccard similarity.
         """
         duplicate_groups: List[DuplicateGroup] = []
 
@@ -1539,7 +1545,7 @@ class DuplicateScanner:
 
         # Parallel document hashing
         self._update_progress(85, f"STAGE:5/5:Document Similarity|0|Document hashes: 0 / {len(doc_files):,} ({workers} threads)")
-        dhash_groups: Dict[str, List[FileInfo]] = defaultdict(list)
+        hashed_docs: List[FileInfo] = []  # Only docs that produced a valid MinHash
         processed = 0
         last_update = time.monotonic()
 
@@ -1562,7 +1568,7 @@ class DuplicateScanner:
 
                 if dh:
                     fi.d_hash = dh
-                    dhash_groups[dh].append(fi)
+                    hashed_docs.append(fi)
                 processed += 1
 
                 now = time.monotonic()
@@ -1574,107 +1580,64 @@ class DuplicateScanner:
                         f"STAGE:5/5:Document Similarity|{stage_pct}|Document hashes: {processed:,} / {len(doc_files):,} ({workers} threads)"
                     )
 
-        if not self.cancelled and dhash_groups:
+        # Compare all pairs using MinHash similarity
+        if not self.cancelled and len(hashed_docs) >= 2:
             self._update_progress(95, "STAGE:5/5:Document Similarity|80|Finding similar documents...")
 
-            hash_keys = sorted(dhash_groups.keys())
-            total_hashes = len(hash_keys)
-            merged_groups: Set[str] = set()
-
-            bk_tree = BKTree()
-            for dh in hash_keys:
-                bk_tree.insert(dh)
-
+            total_docs = len(hashed_docs)
+            num_pairs = total_docs * (total_docs - 1) // 2
+            pair_count = 0
+            grouped_paths: Set[str] = set()
             last_update = time.monotonic()
 
-            for i, dh1 in enumerate(hash_keys):
+            for i in range(total_docs):
                 if self.cancelled:
                     break
 
-                if dh1 in merged_groups:
+                fi1 = hashed_docs[i]
+                if fi1.path in grouped_paths:
                     continue
 
-                files1 = dhash_groups[dh1]
-                if not files1:
-                    continue
-
-                neighbors = bk_tree.find_within(dh1, SIMHASH_DISTANCE_THRESHOLD)
-                similar = sorted([(nh, d) for nh, d in neighbors
-                                  if d > 0 and nh not in merged_groups and nh > dh1])
-
-                for dh2, distance in similar:
+                for j in range(i + 1, total_docs):
                     if self.cancelled:
                         break
 
-                    if dh2 in merged_groups:
+                    fi2 = hashed_docs[j]
+                    if fi2.path in grouped_paths:
                         continue
 
-                    files2 = dhash_groups[dh2]
-                    if not files2:
-                        continue
+                    pair_count += 1
+                    similarity = minhash_similarity(fi1.d_hash, fi2.d_hash)
 
-                    similarity = calculate_similarity(distance, max_bits=SIMHASH_BITS)
-                    combined = files1 + files2
+                    if similarity >= MINHASH_SIMILARITY_THRESHOLD:
+                        combined = [fi1, fi2]
+                        combined_paths = {f.path for f in combined}
 
-                    combined_paths = {f.path for f in combined}
-                    already_grouped = False
+                        already_grouped = False
+                        for dg in duplicate_groups:
+                            if combined_paths & {f.path for f in dg.files}:
+                                already_grouped = True
+                                break
 
-                    for dg in duplicate_groups:
-                        dg_paths = {f.path for f in dg.files}
-                        if combined_paths & dg_paths:
-                            already_grouped = True
-                            break
-
-                    if not already_grouped:
-                        dg = DuplicateGroup(
-                            files=combined,
-                            similarity=similarity,
-                            is_perceptual=True  # Marks as non-exact (similar)
-                        )
-                        duplicate_groups.append(dg)
-                        if group_callback:
-                            group_callback(dg)
-
-                    merged_groups.add(dh1)
-                    merged_groups.add(dh2)
-                    dhash_groups[dh2] = []
+                        if not already_grouped:
+                            dg = DuplicateGroup(
+                                files=combined,
+                                similarity=similarity,
+                                is_perceptual=True  # Marks as non-exact (similar)
+                            )
+                            duplicate_groups.append(dg)
+                            grouped_paths.update(combined_paths)
+                            if group_callback:
+                                group_callback(dg)
 
                 now = time.monotonic()
                 if now - last_update > 0.1:
                     last_update = now
-                    stage_pct = 80 + int((i / max(total_hashes, 1)) * 20)
+                    stage_pct = 80 + int((pair_count / max(num_pairs, 1)) * 20)
                     self._update_progress(
-                        95 + int((i / max(total_hashes, 1)) * 5),
-                        f"STAGE:5/5:Document Similarity|{stage_pct}|Comparing: {i:,} / {total_hashes:,} hashes"
+                        95 + int((pair_count / max(num_pairs, 1)) * 5),
+                        f"STAGE:5/5:Document Similarity|{stage_pct}|Comparing: {pair_count:,} / {num_pairs:,} pairs"
                     )
-
-            # Exact SimHash matches (same hash, different files)
-            for dh, doc_files_group in dhash_groups.items():
-                if self.cancelled:
-                    break
-
-                if dh in merged_groups:
-                    continue
-
-                if len(doc_files_group) >= 2:
-                    doc_paths = {f.path for f in doc_files_group}
-                    already_grouped = False
-
-                    for dg in duplicate_groups:
-                        dg_paths = {f.path for f in dg.files}
-                        if doc_paths & dg_paths:
-                            already_grouped = True
-                            break
-
-                    if not already_grouped:
-                        dg = DuplicateGroup(
-                            files=doc_files_group,
-                            similarity=100.0,
-                            is_perceptual=True
-                        )
-                        duplicate_groups.append(dg)
-                        if group_callback:
-                            group_callback(dg)
 
         return duplicate_groups
 
