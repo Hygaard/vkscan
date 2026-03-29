@@ -600,7 +600,7 @@ def compute_simhash(text: str, hash_bits: int = SIMHASH_BITS,
 
     SimHash works by:
     1. Splitting text into overlapping word n-grams (shingles)
-    2. Hashing each shingle with SHA-256
+    2. Hashing each shingle with SHA-256 (truncated to hash_bits)
     3. Weighting bit positions (+1/-1) across all shingle hashes
     4. Collapsing into a final fingerprint where each bit = majority vote
 
@@ -615,33 +615,31 @@ def compute_simhash(text: str, hash_bits: int = SIMHASH_BITS,
     if len(words) < ngram_size:
         return None
 
-    # Build shingles (overlapping n-grams)
-    shingles = []
-    for i in range(len(words) - ngram_size + 1):
-        shingle = " ".join(words[i:i + ngram_size])
-        shingles.append(shingle)
-
-    if not shingles:
+    if len(words) - ngram_size + 1 <= 0:
         return None
+
+    # Pre-compute bit masks for fast bit extraction
+    bit_masks = [(1 << bp) for bp in range(hash_bits)]
 
     # Weighted bit vector
     bit_counts = [0] * hash_bits
 
-    for shingle in shingles:
-        # Hash each shingle to get uniformly distributed bits
-        h = hashlib.sha256(shingle.encode("utf-8")).hexdigest()
-        h_int = int(h, 16)
-        for bit_pos in range(hash_bits):
-            if h_int & (1 << bit_pos):
-                bit_counts[bit_pos] += 1
+    # Slide through shingles without building a list (saves memory for large docs)
+    mask = (1 << hash_bits) - 1  # Truncate SHA-256 to hash_bits
+    for i in range(len(words) - ngram_size + 1):
+        shingle = " ".join(words[i:i + ngram_size])
+        h_int = int(hashlib.sha256(shingle.encode("utf-8")).hexdigest(), 16) & mask
+        for bp in range(hash_bits):
+            if h_int & bit_masks[bp]:
+                bit_counts[bp] += 1
             else:
-                bit_counts[bit_pos] -= 1
+                bit_counts[bp] -= 1
 
     # Collapse to fingerprint: 1 if positive, 0 if negative
     fingerprint = 0
-    for bit_pos in range(hash_bits):
-        if bit_counts[bit_pos] > 0:
-            fingerprint |= (1 << bit_pos)
+    for bp in range(hash_bits):
+        if bit_counts[bp] > 0:
+            fingerprint |= bit_masks[bp]
 
     hex_chars = hash_bits // 4
     return format(fingerprint, f'0{hex_chars}x')
