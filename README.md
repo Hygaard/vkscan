@@ -11,13 +11,29 @@ VKScan scans your folders, finds exact copies and similar-looking images, and le
 
 Grab the latest build from the [Releases](../../releases) page — no Python needed.
 
-| Platform | File |
-|----------|------|
-| Windows | `VKScan-Windows.exe` |
-| Linux | `VKScan-Linux` |
-| macOS | `VKScan-macOS` |
+### Windows
 
-Or run from source:
+Download `VKScan-Windows.exe` and double-click to run.
+
+### macOS
+
+```bash
+# Download, make executable, and run
+chmod +x VKScan-macOS-arm64
+./VKScan-macOS-arm64
+```
+
+If macOS blocks it: go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
+### Linux
+
+```bash
+# Download, make executable, and run
+chmod +x VKScan-Linux-x86_64
+./VKScan-Linux-x86_64
+```
+
+### Run from source (any platform)
 
 ```bash
 pip install -r requirements.txt
