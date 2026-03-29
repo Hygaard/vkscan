@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.1.8
+VKScan with GUI - v1.1.9
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.1.8
+Version: 1.1.9
 """
 
 import os
@@ -62,7 +62,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.1.8"
+VERSION = "1.1.9"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -2753,29 +2753,56 @@ class DuplicateFinderApp:
         self._active_dropdown = (None, dropdown)
 
     def _open_file_location(self) -> None:
-        """Open the containing folder of the selected file in the system file manager."""
+        """Open the containing folder with the selected file(s) highlighted.
+
+        Groups files by parent directory and opens one window per folder.
+        Windows Explorer and macOS Finder natively select the file.
+        Linux: uses dbus to ask Nautilus/Dolphin/Thunar to select files,
+        falls back to xdg-open if dbus is unavailable.
+        """
         paths = self._get_selected_paths()
         if not paths:
             return
 
-        path = paths[0]
-        folder = os.path.dirname(path)
+        # Group by parent folder so we open one window per folder
+        by_folder: Dict[str, List[str]] = {}
+        for p in paths:
+            folder = os.path.dirname(p)
+            by_folder.setdefault(folder, []).append(p)
 
-        if not os.path.exists(folder):
-            messagebox.showwarning("Not Found", f"Folder no longer exists:\n{folder}")
-            return
+        for folder, file_paths in by_folder.items():
+            if not os.path.exists(folder):
+                messagebox.showwarning("Not Found", f"Folder no longer exists:\n{folder}")
+                continue
 
-        try:
-            if sys.platform == "win32":
-                # Select the file in Explorer
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", path])
-            else:
-                # Linux: open the containing folder
-                subprocess.Popen(["xdg-open", folder])
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not open file location:\n{e}")
+            try:
+                if sys.platform == "win32":
+                    # Explorer /select only supports one file, open once per file
+                    for fp in file_paths:
+                        subprocess.Popen(["explorer", "/select,", os.path.normpath(fp)])
+                elif sys.platform == "darwin":
+                    # open -R selects the file in Finder; pass all files at once
+                    subprocess.Popen(["open", "-R"] + file_paths)
+                else:
+                    # Linux: try dbus to select files in the default file manager
+                    opened = False
+                    try:
+                        uris = " ".join(f"file://{fp}" for fp in file_paths)
+                        subprocess.Popen([
+                            "dbus-send", "--session", "--dest=org.freedesktop.FileManager1",
+                            "--type=method_call",
+                            "/org/freedesktop/FileManager1",
+                            "org.freedesktop.FileManager1.ShowItems",
+                            f"array:string:{','.join(f'file://{fp}' for fp in file_paths)}",
+                            "string:"
+                        ])
+                        opened = True
+                    except Exception:
+                        pass
+                    if not opened:
+                        subprocess.Popen(["xdg-open", folder])
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open file location:\n{e}")
 
     def _auto_select_duplicates(self) -> None:
         """Select all files except the first (oldest) in each duplicate group.
