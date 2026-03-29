@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.1.1
+VKScan with GUI - v1.1.2
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.1.1
+Version: 1.1.2
 """
 
 import os
@@ -62,7 +62,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -224,16 +224,11 @@ class HashCache:
             self._conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_path ON hash_cache(path)
             """)
-            # Invalidate cached phash values if they don't match current hash size.
-            # 256-bit (hash_size=16) = 64 hex chars; 64-bit (hash_size=8) = 16 hex chars.
-            # If the stored hash length doesn't match PHASH_BLOCK_SIZE**2 / 4, wipe all.
-            expected_hex_len = (PHASH_BLOCK_SIZE * PHASH_BLOCK_SIZE) // 4  # bits -> hex chars
+            # v1.1.2: wipe all cached phash values unconditionally.
+            # Previous releases cached phash with wrong hash_size, making
+            # perceptual comparison fail silently. Clean slate.
             try:
-                sample = self._conn.execute(
-                    "SELECT phash FROM hash_cache WHERE phash IS NOT NULL LIMIT 1"
-                ).fetchone()
-                if sample and len(sample[0]) != expected_hex_len:
-                    self._conn.execute("UPDATE hash_cache SET phash = NULL")
+                self._conn.execute("UPDATE hash_cache SET phash = NULL")
             except Exception:
                 pass
             self._conn.commit()
@@ -795,26 +790,15 @@ class DuplicateScanner:
         except (PermissionError, OSError):
             return None
 
-    def compute_perceptual_hash(self, path: str, mtime: float = 0, size: int = 0) -> Optional[str]:
+    def compute_perceptual_hash(self, path: str) -> Optional[str]:
         """Compute perceptual hash of an image.
-
-        Uses the hash cache when mtime/size are provided.
 
         Args:
             path: Path to image file
-            mtime: File modification time (for cache lookup)
-            size: File size in bytes (for cache lookup)
 
         Returns:
             Hex-encoded perceptual hash or None on error
         """
-        # Check cache first
-        if mtime and size:
-            cache = get_hash_cache()
-            cached = cache.get(path, mtime, size)
-            if cached and cached.get("phash"):
-                return cached["phash"]
-
         try:
             file_size = os.path.getsize(path)
             if file_size > MAX_IMAGE_FILE_BYTES:
@@ -833,14 +817,7 @@ class DuplicateScanner:
                     img = img.convert("RGB")
 
                 ph = phash(img, hash_size=PHASH_BLOCK_SIZE)
-                result = str(ph)
-
-                # Store in cache
-                if mtime and size:
-                    cache = get_hash_cache()
-                    cache.put(path, mtime, size, phash=result)
-
-                return result
+                return str(ph)
 
         except (PermissionError, OSError, ValueError):
             return None
@@ -1154,31 +1131,17 @@ class DuplicateScanner:
         if not image_files or self.cancelled:
             return duplicate_groups
 
-        # Parallel perceptual hashing — use ProcessPoolExecutor for CPU-bound
-        # DCT work when there are enough images to justify process spawn overhead.
-        # Falls back to ThreadPoolExecutor for small batches.
-        use_processes = len(image_files) >= PROCESS_POOL_THRESHOLD
-        pool_label = "processes" if use_processes else "threads"
-        self._update_progress(60, f"STAGE:4/4:Verifying|55|Image hashes: 0 / {len(image_files):,} ({workers} {pool_label})")
+        # Parallel perceptual hashing
+        self._update_progress(60, f"STAGE:4/4:Verifying|55|Image hashes: 0 / {len(image_files):,} ({workers} threads)")
         phash_groups: Dict[str, List[FileInfo]] = defaultdict(list)
         processed = 0
         last_update = time.monotonic()
 
-        PoolClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
-
-        with PoolClass(max_workers=workers) as pool:
-            if use_processes:
-                # ProcessPoolExecutor: use top-level picklable function (takes tuple)
-                future_to_file = {
-                    pool.submit(_compute_perceptual_hash_standalone, (fi.path, fi.mtime, fi.size)): fi
-                    for fi in image_files
-                }
-            else:
-                # ThreadPoolExecutor: use instance method (no pickle needed)
-                future_to_file = {
-                    pool.submit(self.compute_perceptual_hash, fi.path, fi.mtime, fi.size): fi
-                    for fi in image_files
-                }
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_file = {
+                pool.submit(self.compute_perceptual_hash, fi.path): fi
+                for fi in image_files
+            }
 
             for future in as_completed(future_to_file):
                 if self.cancelled:
@@ -1202,26 +1165,20 @@ class DuplicateScanner:
                     stage_pct = 55 + int((processed / len(image_files)) * 25)
                     self._update_progress(
                         60 + int((processed / len(image_files)) * 20),
-                        f"STAGE:4/4:Verifying|{stage_pct}|Image hashes: {processed:,} / {len(image_files):,} ({workers} {pool_label})"
+                        f"STAGE:4/4:Verifying|{stage_pct}|Image hashes: {processed:,} / {len(image_files):,} ({workers} threads)"
                     )
 
         if not self.cancelled and phash_groups:
-            self._update_progress(80, "STAGE:4/4:Verifying|80|Building BK-tree for similarity search...")
+            self._update_progress(80, "STAGE:4/4:Verifying|80|Finding similar images...")
 
-            hash_keys = list(phash_groups.keys())
-            total_hashes = len(hash_keys)
-
-            # Build BK-tree — O(n log n) insert
-            bk_tree = BKTree()
-            for ph in hash_keys:
-                bk_tree.insert(ph)
-
+            hash_keys = sorted(phash_groups.keys())
+            num_pairs = len(hash_keys) * (len(hash_keys) - 1) // 2
+            pair_count = 0
             merged_groups: Set[str] = set()
-            grouped_paths: Set[str] = set()  # Track all paths already in a group
+
             last_update = time.monotonic()
 
-            # Query each hash for neighbors — O(n log n) total vs O(n^2) brute force
-            for idx, ph1 in enumerate(hash_keys):
+            for i, ph1 in enumerate(hash_keys):
                 if self.cancelled:
                     break
 
@@ -1232,49 +1189,57 @@ class DuplicateScanner:
                 if not files1:
                     continue
 
-                # Find all hashes within threshold (includes self at distance 0)
-                neighbors = bk_tree.find_within(ph1, _config.image_similarity_threshold)
+                for j, ph2 in enumerate(hash_keys[i + 1:], i + 1):
+                    if self.cancelled:
+                        break
 
-                # Separate exact matches (distance=0) from similar matches
-                similar_hashes = [(nh, d) for nh, d in neighbors if d > 0 and nh not in merged_groups]
+                    if ph2 in merged_groups:
+                        continue
 
-                if similar_hashes:
-                    # Merge all similar hashes into one group with this hash
-                    combined = list(files1)
-                    min_distance = min(d for _, d in similar_hashes)
+                    pair_count += 1
+                    distance = hamming_distance(ph1, ph2)
 
-                    for nh, d in similar_hashes:
-                        nh_files = phash_groups[nh]
-                        if nh_files:
-                            combined.extend(nh_files)
-                            merged_groups.add(nh)
-                            phash_groups[nh] = []
+                    if 0 < distance <= _config.image_similarity_threshold:
+                        files2 = phash_groups[ph2]
+                        if not files2:
+                            continue
 
-                    combined_paths = {f.path for f in combined}
-                    if not (combined_paths & grouped_paths):
-                        similarity = calculate_similarity(min_distance)
-                        dg = DuplicateGroup(
-                            files=combined,
-                            similarity=similarity,
-                            is_perceptual=True
+                        similarity = calculate_similarity(distance)
+                        combined = files1 + files2
+
+                        combined_paths = {f.path for f in combined}
+                        already_grouped = False
+
+                        for dg in duplicate_groups:
+                            dg_paths = {f.path for f in dg.files}
+                            if combined_paths & dg_paths:
+                                already_grouped = True
+                                break
+
+                        if not already_grouped:
+                            dg = DuplicateGroup(
+                                files=combined,
+                                similarity=similarity,
+                                is_perceptual=True
+                            )
+                            duplicate_groups.append(dg)
+                            if group_callback:
+                                group_callback(dg)
+
+                        merged_groups.add(ph1)
+                        merged_groups.add(ph2)
+                        phash_groups[ph2] = []
+
+                    now = time.monotonic()
+                    if num_pairs > 0 and now - last_update > 0.1:
+                        last_update = now
+                        stage_pct = 80 + int((pair_count / num_pairs) * 20)
+                        self._update_progress(
+                            80 + int((pair_count / num_pairs) * 15),
+                            f"STAGE:4/4:Verifying|{stage_pct}|Comparing: {pair_count:,} / {num_pairs:,} pairs"
                         )
-                        duplicate_groups.append(dg)
-                        grouped_paths.update(combined_paths)
-                        if group_callback:
-                            group_callback(dg)
 
-                    merged_groups.add(ph1)
-
-                now = time.monotonic()
-                if now - last_update > 0.1:
-                    last_update = now
-                    stage_pct = 80 + int((idx / max(total_hashes, 1)) * 20)
-                    self._update_progress(
-                        80 + int((idx / max(total_hashes, 1)) * 15),
-                        f"STAGE:4/4:Verifying|{stage_pct}|BK-tree search: {idx:,} / {total_hashes:,} hashes"
-                    )
-
-            # Exact perceptual hash matches (same hash, different files)
+            # Exact perceptual hash matches
             for ph, img_files in phash_groups.items():
                 if self.cancelled:
                     break
@@ -1284,14 +1249,21 @@ class DuplicateScanner:
 
                 if len(img_files) >= 2:
                     img_paths = {f.path for f in img_files}
-                    if not (img_paths & grouped_paths):
+                    already_grouped = False
+
+                    for dg in duplicate_groups:
+                        dg_paths = {f.path for f in dg.files}
+                        if img_paths & dg_paths:
+                            already_grouped = True
+                            break
+
+                    if not already_grouped:
                         dg = DuplicateGroup(
                             files=img_files,
                             similarity=100.0,
                             is_perceptual=True
                         )
                         duplicate_groups.append(dg)
-                        grouped_paths.update(img_paths)
                         if group_callback:
                             group_callback(dg)
 
