@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Hygaard
 # Licensed under the GNU General Public License v3.0 — see LICENSE for details.
 """
-VKScan with GUI - v1.1.7
+VKScan with GUI - v1.1.8
 
 A comprehensive duplicate file detection tool featuring:
 - Exact duplicate detection via SHA-256 hashing with byte-level verification
@@ -12,7 +12,7 @@ A comprehensive duplicate file detection tool featuring:
 - Memory-efficient design for large file collections
 - Safe deletion via trash/staging directory
 
-Version: 1.1.7
+Version: 1.1.8
 """
 
 import os
@@ -62,7 +62,7 @@ except ImportError:
 # =============================================================================
 
 # Version
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 
 # Security: Limit maximum image pixels to prevent DoS via large images
 MAX_IMAGE_PIXELS = 100_000_000  # ~100 megapixels (modern phones shoot 50-108MP)
@@ -2301,20 +2301,32 @@ class DuplicateFinderApp:
                         header, stage_pct_str, detail = latest_message[6:].split("|", 2)
                         stage_num_str, stage_name = header.split(":", 1)
                         stage_pct = int(stage_pct_str)
-                        # Show elapsed time for the current stage
+                        # ETA based on item-level throughput from the detail text.
+                        # Detail contains counts like "342 / 1,200" or "5 / 23 groups".
+                        # Parse those to get actual progress, not the compressed stage percent.
                         if stage_num_str != self._current_stage_key:
                             self._current_stage_key = stage_num_str
                             self._stage_start_time = time.monotonic()
                         if self._stage_start_time is not None:
                             elapsed = time.monotonic() - self._stage_start_time
+                            eta_str = None
                             if elapsed >= 2.0:
-                                if elapsed < 60:
-                                    elapsed_str = f"{int(elapsed)}s"
-                                elif elapsed < 3600:
-                                    elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
-                                else:
-                                    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
-                                detail = f"{detail}  ({elapsed_str} elapsed)"
+                                # Try to parse "N / M" or "N,NNN / M,MMM" from detail
+                                count_match = re.search(r'([\d,]+)\s*/\s*([\d,]+)', detail)
+                                if count_match:
+                                    done = int(count_match.group(1).replace(',', ''))
+                                    total = int(count_match.group(2).replace(',', ''))
+                                    if done > 0 and total > done:
+                                        rate = done / elapsed  # items per second
+                                        remaining = (total - done) / rate
+                                        if remaining < 60:
+                                            eta_str = f"~{int(remaining)}s"
+                                        elif remaining < 3600:
+                                            eta_str = f"~{int(remaining // 60)}m {int(remaining % 60)}s"
+                                        else:
+                                            eta_str = f"~{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
+                            if eta_str:
+                                detail = f"{detail}  (ETA: {eta_str})"
                         self.stage_label.config(text=f"Stage {stage_num_str}: {stage_name}")
                         self.progress_var.set(stage_pct)
                         self.detail_label.config(text=detail)
